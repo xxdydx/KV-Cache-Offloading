@@ -1,0 +1,24 @@
+spec.md
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Profiles and large artifacts (raw CSVs in results/ ARE committed)
+*.nsys-rep
+*.qdrep
+*.sqlite
+*.pt
+*.safetensors
+hf_cache/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+.env
