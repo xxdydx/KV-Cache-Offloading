@@ -1,0 +1,12 @@
+{
+  "requests": 62,
+  "output_tokens": 5920,
+  "server_success_counter_delta": 62.0,
+  "server_generation_counter_delta": 5920.0,
+  "max_sampled_running": 2.0,
+  "max_sampled_waiting": 0.0,
+  "requests_with_multitoken_events": [],
+  "all_requested_token_counts_matched": true,
+  "all_reported_prefix_cache_hits_zero": true,
+  "server_counters_match_probe": true
+}

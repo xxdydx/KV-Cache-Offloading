@@ -1,0 +1,16 @@
+{
+  "health_status": 200,
+  "model": "local",
+  "usage": {
+    "prompt_tokens": 3,
+    "total_tokens": 4,
+    "completion_tokens": 1,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "created_cache_tokens": null,
+      "multimodal_tokens": null
+    },
+    "completion_tokens_details": null
+  },
+  "completion_succeeded": true
+}

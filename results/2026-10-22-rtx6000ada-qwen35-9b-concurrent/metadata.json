@@ -1,0 +1,65 @@
+{
+  "started_utc": "2026-10-22T14:42:15.324713+00:00",
+  "hostname": "sbx-official-dev",
+  "python": "3.12.14",
+  "args": {
+    "url": "http://127.0.0.1:8002",
+    "model": "local",
+    "out": "/tmp/disagg-concurrent-20261022-v2/results",
+    "lengths": [
+      512,
+      2048,
+      8192,
+      16384
+    ],
+    "repeats": 3,
+    "seed": 20261022,
+    "solo_only": false
+  },
+  "models": {
+    "object": "list",
+    "data": [
+      {
+        "id": "local",
+        "object": "model",
+        "created": 1792680135,
+        "owned_by": "vllm",
+        "root": "InfiniCloud/Qwen3.5-9B-GPTQ-INT4-G128",
+        "parent": null,
+        "max_model_len": 131072,
+        "permission": [
+          {
+            "id": "modelperm-a5d0ee172ddb0b88",
+            "object": "model_permission",
+            "created": 1792680135,
+            "allow_create_engine": false,
+            "allow_sampling": true,
+            "allow_logprobs": true,
+            "allow_search_indices": false,
+            "allow_view": true,
+            "allow_fine_tuning": false,
+            "organization": "*",
+            "group": null,
+            "is_blocking": false
+          }
+        ]
+      }
+    ]
+  },
+  "versions": {
+    "torch": "2.13.0",
+    "vllm": "0.30.0",
+    "transformers": "5.20.2",
+    "aiohttp": "3.14.5"
+  },
+  "gpu": "name, memory.total [MiB], driver_version, clocks.current.sm [MHz], clocks.current.memory [MHz], power.limit [W]\nNVIDIA RTX 6000 Ada Generation, 49140 MiB, 595.99.02, 2505 MHz, 9501 MHz, 300.00 W\n",
+  "server_processes": [
+    " 117707  117699 /opt/venv/bin/python3 /opt/venv/bin/vllm serve InfiniCloud/Qwen3.5-9B-GPTQ-INT4-G128 --revision bd37adf223bdfd08c32c144a954bffe48ef581f0 --tokenizer InfiniCloud/Qwen3.5-9B-GPTQ-INT4-G128 --tokenizer-revision bd37adf223bdfd08c32c144a954bffe48ef581f0 --load-format safetensors --safetensors-load-strategy lazy --host 127.0.0.1 --port 8002 --served-model-name local --max-model-len 131072 --gpu-memory-utilization 0.90 --kv-cache-dtype fp8 --enable-prefix-caching --enable-prompt-tokens-details --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 --language-model-only --override-generation-config {\"temperature\":0} --max-num-seqs 8 --enforce-eager"
+  ],
+  "limitations": [
+    "Interpret concurrency from server_processes and scheduler samples",
+    "GPTQ INT4 weights, FP8 KV; not the spec's BF16 Qwen3-8B",
+    "Client-observed loopback token timings include API overhead",
+    "Shared existing service; other clients are not locked out"
+  ]
+}
