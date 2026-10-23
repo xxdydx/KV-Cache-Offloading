@@ -12,6 +12,25 @@ starting at commit `bb823b3e06983d71485a8e1f23715ebd87d98ef8`. See
 [upstream provenance and local changes](nanovllm_upstream/UPSTREAM.md).
 The original [MIT license](nanovllm_upstream/LICENSE) is retained.
 
+## Tracking changes from stock nano-vllm
+
+The `nanovllm-stock` tag marks an exact stock engine snapshot from the upstream
+commit above. The commits immediately after it introduce greedy sampling,
+independent worker initialization, and KV handoff separately. Earlier project
+history is preserved; this tag establishes the engine comparison point.
+
+```bash
+# List engine changes since the stock snapshot, oldest first.
+git log --reverse --oneline nanovllm-stock..HEAD -- nanovllm_upstream/
+
+# See the complete engine source difference from stock.
+git diff nanovllm-stock HEAD -- nanovllm_upstream/nanovllm/
+```
+
+Keep future engine changes in focused commits after this baseline. See
+[baseline details](nanovllm_upstream/UPSTREAM.md#stock-baseline-and-change-history)
+for the initial commit sequence and stock benchmarking instructions.
+
 **Question:** when does shipping KV state between machines beat keeping a request on one GPU, and how far can a purpose-built transfer path cut that cost?
 
 - Model: Qwen3-8B (BF16, ~144 KB KV/token)
