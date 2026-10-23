@@ -183,8 +183,11 @@ class Probe:
                     probe = asyncio.create_task(self.request(prompt(512), 64, "queued_short", "probe", length, repeat))
                     await asyncio.gather(blocker, probe)
                 for length, repeat in jobs:
+                    decoder_prompt = prompt(512)
+                    if self.args.paired_decoder_baselines:
+                        await self.request(decoder_prompt, 128, "decoder_control", "decoder", length, repeat)
                     ready = asyncio.Event()
-                    decoder = asyncio.create_task(self.request(prompt(512), 128, "inject_long", "decoder", length, repeat, ready))
+                    decoder = asyncio.create_task(self.request(decoder_prompt, 128, "inject_long", "decoder", length, repeat, ready))
                     # Race completion against readiness so an HTTP failure cannot deadlock.
                     waiter = asyncio.create_task(ready.wait())
                     await asyncio.wait([decoder, waiter], return_when=asyncio.FIRST_COMPLETED)
@@ -217,6 +220,8 @@ if __name__ == "__main__":
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--seed", type=int, default=20261022)
     parser.add_argument("--solo-only", action="store_true")
+    parser.add_argument("--paired-decoder-baselines", action="store_true",
+                        help="Measure the same decoder input alone before each injection pair")
     parser.add_argument("--checkpoint", help="Local checkpoint directory to record configuration/revision")
     parser.add_argument("--description", default="See server command for model and cache configuration")
     args = parser.parse_args()

@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -53,6 +54,9 @@ def main(args):
     ], text=True).strip()
     if active:
         raise RuntimeError(f"Expected idle GPUs before isolated benchmark: {active}")
+    with socket.socket() as sock:
+        if sock.connect_ex(("127.0.0.1",args.port)) == 0:
+            raise RuntimeError("Experiment port is already in use")
     environment = dict(os.environ, CUDA_VISIBLE_DEVICES=str(args.gpu),
                        OMP_NUM_THREADS="2", TORCHINDUCTOR_COMPILE_THREADS="1",
                        VLLM_WORKER_MULTIPROC_METHOD="spawn",
@@ -67,11 +71,12 @@ def main(args):
     (out / "experiment.json").write_text(json.dumps(metadata, indent=2))
     finished = threading.Event()
     origin = time.perf_counter()
+    current_label = "setup"
 
     def monitor():
         with (out / "resource_samples.jsonl").open("w") as handle:
             while not finished.is_set():
-                sample = dict(t=time.perf_counter()-origin, memory=memory_info(),
+                sample = dict(t=time.perf_counter()-origin, configuration=current_label, memory=memory_info(),
                               gpu=list(csv.DictReader(gpu_snapshot().splitlines(), skipinitialspace=True)))
                 handle.write(json.dumps(sample)+"\n")
                 handle.flush()
@@ -81,15 +86,17 @@ def main(args):
     thread.start()
     passed = False
     try:
-        for concurrency in [1, 8]:
-            label = f"seqs{concurrency}"
+        configurations = [(budget, concurrency) for budget in args.budgets for concurrency in args.concurrencies]
+        for budget, concurrency in configurations:
+            label = f"chunk{budget}_seqs{concurrency}" if len(args.budgets)>1 else f"seqs{concurrency}"
+            current_label = label
             command = [str(Path(sys.executable).with_name("vllm")), "serve", args.model,
                        "--served-model-name", "qwen3-8b", "--host", "127.0.0.1",
                        "--port", str(args.port), "--dtype", "bfloat16",
                        "--kv-cache-dtype", "auto", "--tensor-parallel-size", "1",
                        "--max-model-len", str(max(args.lengths)+256),
                        "--max-num-seqs", str(concurrency),
-                       "--max-num-batched-tokens", "2048", "--enable-chunked-prefill",
+                       "--max-num-batched-tokens", str(budget), "--enable-chunked-prefill",
                        "--no-enable-prefix-caching", "--gpu-memory-utilization", "0.6",
                        "--enforce-eager", "--generation-config", "vllm", "--seed", "20261023",
                        "--disable-log-requests"]
@@ -113,12 +120,21 @@ def main(args):
                         raise RuntimeError(f"{label} server startup timed out")
                     time.sleep(2)
                 print("HEALTHY", label, flush=True)
-                subprocess.run([sys.executable, "-m", "bench.serve_probe",
+                probe_command = [sys.executable, "-m", "bench.serve_probe",
                                 "--url", f"http://127.0.0.1:{args.port}", "--model", "qwen3-8b",
                                 "--checkpoint", args.model,
-                                "--description", "Qwen3-8B BF16 weights and KV; eager; prefill budget 2048",
+                                "--description", f"Qwen3-8B BF16 weights and KV; eager; prefill budget {budget}",
                                 "--out", str(out / label), "--lengths", *map(str,args.lengths),
-                                "--repeats", str(args.repeats)], env=environment, check=True)
+                                "--repeats", str(args.repeats)]
+                if args.paired_decoder_baselines:
+                    probe_command.append("--paired-decoder-baselines")
+                subprocess.run(probe_command, env=environment, check=True)
+                if args.mixed_requests:
+                    subprocess.run([sys.executable, "-m", "bench.mixed_probe",
+                                    "--url", f"http://127.0.0.1:{args.port}", "--model", "qwen3-8b",
+                                    "--checkpoint", args.model, "--out", str(out / (label+"_mixed")),
+                                    "--requests", str(args.mixed_requests), "--concurrency", str(args.mixed_concurrency),
+                                    "--repeats", str(args.repeats)], env=environment, check=True)
             finally:
                 stop_server(server)
             print("STOPPED", label, flush=True)
@@ -142,4 +158,12 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=8002)
     parser.add_argument("--lengths", nargs="+", type=int, default=[512, 2048, 8192, 16384])
     parser.add_argument("--repeats", type=int, default=3)
-    main(parser.parse_args())
+    parser.add_argument("--budgets", nargs="+", type=int, default=[2048])
+    parser.add_argument("--concurrencies", nargs="+", type=int, default=[1,8])
+    parser.add_argument("--paired-decoder-baselines", action="store_true")
+    parser.add_argument("--mixed-requests", type=int, default=0)
+    parser.add_argument("--mixed-concurrency", type=int, default=8)
+    args = parser.parse_args()
+    if any(n<1 for n in args.budgets+args.concurrencies+args.lengths) or args.repeats<1:
+        parser.error("budgets, concurrency, lengths and repeats must be positive")
+    main(args)
