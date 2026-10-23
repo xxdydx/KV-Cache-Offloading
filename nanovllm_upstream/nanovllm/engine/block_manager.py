@@ -100,21 +100,6 @@ class BlockManager:
         seq.num_cached_tokens = 0
         seq.block_table.clear()
 
-    def allocate_for_resume(self, seq: Sequence, num_cached_tokens: int):
-        """Reserve fresh blocks for written KV, leaving the pending token to decode.
-
-        At a block boundary, may_append() will allocate the pending token's block
-        on the next decode step. Do not allocate that extra block twice here.
-        Imported blocks are published to the prefix cache only after their copy.
-        """
-        if seq.block_table or not 0 < num_cached_tokens == len(seq) - 1:
-            raise ValueError("resume needs an empty block table and one uncached token")
-        num_blocks = (num_cached_tokens + self.block_size - 1) // self.block_size
-        if len(self.free_block_ids) < num_blocks:
-            raise MemoryError("not enough free KV blocks to resume")
-        seq.block_table = [self._allocate_block() for _ in range(num_blocks)]
-        seq.num_cached_tokens = num_cached_tokens
-
     def can_append(self, seq: Sequence) -> bool:
         return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
 
