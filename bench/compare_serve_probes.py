@@ -13,6 +13,9 @@ import matplotlib.pyplot as plt
 
 def compare(serial, concurrent, out):
     out.mkdir(parents=True, exist_ok=True)
+    metadata = json.loads((concurrent / "metadata.json").read_text())
+    description = metadata.get("description", "Qwen3.5-9B GPTQ INT4 weights; FP8 KV; eager")
+    repetitions = metadata["args"]["repeats"]
     def read(folder):
         return list(csv.DictReader((folder / "summary.csv").open()))
     tables = [read(serial), read(concurrent)]
@@ -36,8 +39,8 @@ def compare(serial, concurrent, out):
         ax.set_ylim(bottom=0)
         ax.legend(frameon=False)
     fig.suptitle("Concurrency exposes prefill/decode interference", fontsize=17, fontweight="bold")
-    fig.supxlabel("RTX 6000 Ada · Qwen3.5-9B GPTQ INT4 · FP8 KV · eager · 3 repetitions · median with min–max range\n"
-                  "Same model and serving flags; concurrency and port changed. Separate runs; clocks were not locked.", fontsize=9)
+    fig.supxlabel(f"RTX 6000 Ada · {description} · {repetitions} repetitions · median with min–max range\n"
+                  "Same model; see captured launch arguments. Separate runs; clocks were not locked.", fontsize=9)
     fig.savefig(out / "concurrency_comparison.png", dpi=180)
     fig.savefig(out / "concurrency_comparison.pdf")
     plt.close(fig)
@@ -63,8 +66,8 @@ def compare(serial, concurrent, out):
     fig.savefig(out / "interference_timeline.pdf")
     plt.close(fig)
     lines = ["# Serialized versus concurrent serving", "",
-             "The same Qwen3.5-9B GPTQ INT4 model ran on one RTX 6000 Ada with FP8 KV and eager execution. The independent experiment server changed max_num_seqs from 1 to 8 and port from 8001 to 8002; all other launch arguments were preserved.", "",
-             "Each result is the median of three repetitions. Only two benchmark requests overlap; eight is the configured capacity, not measured batch size.", "",
+             f"Both runs used one RTX 6000 Ada: {description}. The independent experiment server changed max_num_seqs from 1 to 8; see saved command lines for the full configuration.", "",
+             f"Each result is the median of {repetitions} repetitions. Only two benchmark requests overlap; eight is the configured capacity, not measured batch size.", "",
              "| Long prompt | Decoder max gap, seqs=1 (ms) | Decoder max gap, seqs=8 (ms) | Short probe TTFT, seqs=1 (ms) | Short probe TTFT, seqs=8 (ms) |", "|---:|---:|---:|---:|---:|"]
     for n in lengths:
         numbers = [statistics.median(vals(t,n,"inject_long","decoder","max_itl_ms")) for t in tables]
@@ -73,8 +76,8 @@ def compare(serial, concurrent, out):
     lines += ["", "The injection test adds the long request after the existing decoder emits 16 of its 128 tokens. The queued-short test submits a 512-token/64-output-token probe 20 ms after a long-prompt/128-output-token request.", "",
               "The concurrent server's startup log confirms enable_chunked_prefill=True. The pauses occur with chunking enabled; this experiment does not compare chunking on versus off.", "",
               "The maximum token gap exposes an individual freeze that p99 can miss when it occurs in fewer than 1% of gaps. This is a small controlled experiment, not a production p99 estimate.", "",
-              "These runs measure single-GPU scheduling behavior. They do not establish disaggregation speedup or a network break-even point. The project spec uses BF16 Qwen3-8B; its KV-size formula should not be applied directly to this Qwen3.5 model.", "",
-              "The original service was restored after the concurrent run; see restoration.json. Raw token IDs/timestamps, scheduler samples, metadata, and counter-validation files live in the two input run directories.", "",
+              "These runs measure single-GPU scheduling behavior. They do not establish disaggregation speedup or a network break-even point. Use only measurements of the same model and cache dtype for a transfer-cost comparison.", "",
+              "Raw token IDs/timestamps, scheduler samples, metadata and server logs are retained with the runs. Service shutdown/restoration evidence, when applicable, lives with the supervisor outputs.", "",
               "## Regenerate", "", "```sh",
               f"python3 -m bench.compare_serve_probes {serial} {concurrent} {out}", "```", ""]
     (out / "report.md").write_text("\n".join(lines))

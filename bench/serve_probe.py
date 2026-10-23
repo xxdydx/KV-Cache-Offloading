@@ -7,6 +7,7 @@ Requires aiohttp. All timing is measured on one loopback client clock.
 import argparse
 import asyncio
 import csv
+import hashlib
 import importlib.metadata
 import json
 import platform
@@ -18,6 +19,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import aiohttp
+
+try:
+    from bench.runtime_info import memory_info
+except ModuleNotFoundError:  # Also support python /path/to/bench/serve_probe.py.
+    from runtime_info import memory_info
 
 
 def pct(values, q):
@@ -65,7 +71,7 @@ class Probe:
     async def request(self, prompt, output, scenario, role, length, repeat, ready=None):
         record = dict(request_id=uuid.uuid4().hex, scenario=scenario, role=role,
                       prompt_length=length, repeat=repeat, requested_output=output,
-                      sent=self.now(), events=[], usage=None)
+                      prompt_token_ids=prompt, sent=self.now(), events=[], usage=None)
         payload = dict(model=self.args.model, prompt=prompt, max_tokens=output,
                        min_tokens=output, ignore_eos=True, temperature=0,
                        stream=True, stream_options={"include_usage": True},
@@ -98,6 +104,8 @@ class Probe:
             raise RuntimeError(f"Expected {output} tokens, received {len(ids)}: {record}")
         if not record["usage"] or record["usage"]["prompt_tokens"] != len(prompt):
             raise RuntimeError(f"Unexpected prompt token accounting: {record['usage']}")
+        if record["usage"]["completion_tokens"] != output:
+            raise RuntimeError(f"Unexpected completion token accounting: {record['usage']}")
         details = record["usage"].get("prompt_tokens_details") or {}
         if details.get("cached_tokens", 0):
             raise RuntimeError(f"Unexpected prefix cache hit: {details}")
@@ -138,9 +146,16 @@ class Probe:
                         gpu=subprocess.check_output(["nvidia-smi", "--query-gpu=name,memory.total,driver_version,clocks.sm,clocks.mem,power.limit", "--format=csv"], text=True),
                         server_processes=subprocess.check_output(["ps", "-eo", "pid,ppid,args"], text=True),
                         limitations=["Interpret concurrency from server_processes and scheduler samples",
-                                     "GPTQ INT4 weights, FP8 KV; not the spec's BF16 Qwen3-8B",
+                                     "Model/dtype/quantization are determined by the captured server command",
                                      "Client-observed loopback token timings include API overhead",
-                                     "Shared existing service; other clients are not locked out"])
+                                     "GPU clocks are recorded but not locked"],
+                        description=self.args.description,
+                        memory=memory_info(),
+                        source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
+        if self.args.checkpoint:
+            checkpoint = Path(self.args.checkpoint)
+            metadata["checkpoint"] = str(checkpoint.resolve())
+            metadata["model_config"] = json.loads((checkpoint / "config.json").read_text())
         # Keep only the server command, excluding other clients' process details.
         metadata["server_processes"] = [line for line in metadata["server_processes"].splitlines() if "vllm serve" in line]
         (self.out / "metadata.json").write_text(json.dumps(metadata, indent=2))
@@ -183,6 +198,7 @@ class Probe:
             await asyncio.gather(sampler, return_exceptions=True)
             (self.out / "scheduler_samples.json").write_text(json.dumps(self.samples))
             (self.out / "metrics_after.txt").write_text(await self.metrics())
+            (self.out / "memory_after.json").write_text(json.dumps(memory_info(), indent=2))
         self.save_summary()
         print(f"Saved {len(self.records)} requests to {self.out}", flush=True)
 
@@ -201,6 +217,8 @@ if __name__ == "__main__":
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--seed", type=int, default=20261022)
     parser.add_argument("--solo-only", action="store_true")
+    parser.add_argument("--checkpoint", help="Local checkpoint directory to record configuration/revision")
+    parser.add_argument("--description", default="See server command for model and cache configuration")
     args = parser.parse_args()
     if Path(args.out, "requests.jsonl").exists():
         parser.error("Choose a new output directory; requests.jsonl already exists")
