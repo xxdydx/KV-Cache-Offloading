@@ -13,12 +13,6 @@ starting at commit `bb823b3e06983d71485a8e1f23715ebd87d98ef8`. See
 The original [MIT license](nanovllm_upstream/LICENSE) is retained.
 
 ## Tracking changes from stock nano-vllm
-
-The `nanovllm-stock` tag marks an exact stock engine snapshot from the upstream
-commit above. The commits immediately after it introduce greedy sampling,
-independent worker initialization, and KV handoff separately. Earlier project
-history is preserved; this tag establishes the engine comparison point.
-
 ```bash
 # List engine changes since the stock snapshot, oldest first.
 git log --reverse --oneline nanovllm-stock..HEAD -- nanovllm_upstream/
@@ -27,9 +21,7 @@ git log --reverse --oneline nanovllm-stock..HEAD -- nanovllm_upstream/
 git diff nanovllm-stock HEAD -- nanovllm_upstream/nanovllm/
 ```
 
-Keep future engine changes in focused commits after this baseline. See
-[baseline details](nanovllm_upstream/UPSTREAM.md#stock-baseline-and-change-history)
-for the initial commit sequence and stock benchmarking instructions.
+## Research Question
 
 **Question:** when does shipping KV state between machines beat keeping a request on one GPU, and how far can a purpose-built transfer path cut that cost?
 
@@ -46,6 +38,3 @@ for the initial commit sequence and stock benchmarking instructions.
 | `results/` | Experiment data and figures; new artifacts are currently gitignored |
 | `bench/` | Scripts that regenerate every figure from `results/` |
 
-_Status: controlled KV handoff correctness is validated. Concurrent
-disaggregated serving is the next implementation milestone. Current two-GPU
-TCP measurements use loopback; they do not measure a physical network._
