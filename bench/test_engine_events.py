@@ -35,6 +35,7 @@ def api(monkeypatch):
     load("nanovllm.engine.sequence", "engine/sequence.py")
     load("nanovllm.engine.block_manager", "engine/block_manager.py")
     load("nanovllm.engine.scheduler", "engine/scheduler.py")
+    load("nanovllm.engine.kv_handoff", "engine/kv_handoff.py")
     runner_module = ModuleType("nanovllm.engine.model_runner")
     runner_module.ModelRunner = object
     monkeypatch.setitem(sys.modules, runner_module.__name__, runner_module)
@@ -54,12 +55,13 @@ class ScriptedRunner:
         return tokens
 
 
-def make_engine(api, batches, budget=8):
+def make_engine(api, batches, budget=8, num_blocks=16):
     engine = api.LLMEngine.__new__(api.LLMEngine)
     engine.scheduler = api.Scheduler(SimpleNamespace(
         max_num_seqs=4, max_num_batched_tokens=budget, eos=99,
-        kvcache_block_size=256, num_kvcache_blocks=16,
+        kvcache_block_size=256, num_kvcache_blocks=num_blocks,
     ))
+    engine._detached_requests = {}
     engine.model_runner = ScriptedRunner(batches)
     engine.tokenizer = SimpleNamespace(
         encode=lambda text: [int(token) for token in text.split()],

@@ -46,6 +46,49 @@ count. Existing `step()` and `generate()` callers keep their return formats.
 Each call to either step method advances inference by one batch; token events
 report only the new output from the `step_with_events()` call that produced it.
 
+## Engine handoff methods
+
+Each worker uses its own process and a TP=1 engine. Both workers must load the
+same checkpoint and use matching KV layout, dtype, and block size.
+
+| Method | Behavior |
+| --- | --- |
+| `detach_request(seq_id)` | Export a CPU `KVSnapshot` and stop scheduling that request, retaining its source blocks |
+| `resume_request(snapshot)` | Import KV, wait for CUDA copy completion, admit the request for decode, and return its destination-local ID |
+| `release_detached_request(seq_id)` | Release the retained source blocks after destination acceptance, or when abandoning the request |
+| `reattach_request(seq_id)` | Resume scheduling the original source sequence with the same ID and existing KV |
+
+Detach between engine steps after an unfinished request has generated at least
+one output token. Queued, partially prefilled, finished, and already detached
+requests cannot be detached. Failed export leaves the request scheduled;
+failed import does not admit a request and releases newly allocated blocks.
+Call these methods from the engine-owning thread between inference steps.
+
+The handoff order across the two worker processes is:
+
+```text
+Source:       snapshot = source.detach_request(source_id)
+Transport:    deliver snapshot to the destination
+Destination:  destination_id = destination.resume_request(snapshot)
+Transport:    acknowledge destination readiness to the source
+Source:       source.release_detached_request(source_id)
+```
+
+The destination continues output indices and the total output-token budget
+from the snapshot. Tokens generated before handoff are included in completed
+outputs but are not replayed as new token events. Source and destination IDs
+are local identifiers; a coordinator must track their relationship.
+
+Reattach only when the destination is known not to have accepted the request;
+reattaching after an uncertain delivery can execute the request twice. Release
+and reattach consume the detached handle and reject repeated calls. Engine
+shutdown also releases retained source blocks. `is_finished()` describes the
+local scheduling queues, so it can be true while detached blocks remain owned.
+
+These methods provide the engine boundary. Persistent worker loops, TCP
+readiness messages, bounded admission, and a streaming coordinator remain
+separate implementation steps. The serial benchmark remains the reference.
+
 ## Research Question
 
 **Question:** when does shipping KV state between machines beat keeping a request on one GPU, and how far can a purpose-built transfer path cut that cost?

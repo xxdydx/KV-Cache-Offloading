@@ -3,6 +3,7 @@ from dataclasses import dataclass, fields
 from time import perf_counter
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
+import torch
 import torch.multiprocessing as mp
 
 from nanovllm.config import Config
@@ -10,6 +11,7 @@ from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
+from nanovllm.engine.kv_handoff import KVSnapshot, export_kv, import_kv
 
 
 @dataclass(frozen=True)
@@ -55,9 +57,12 @@ class LLMEngine:
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
+        self._detached_requests: dict[int, Sequence] = {}
         atexit.register(self.exit)
 
     def exit(self):
+        for seq_id in tuple(self._detached_requests):
+            self.release_detached_request(seq_id)
         self.model_runner.call("exit")
         del self.model_runner
         for p in self.ps:
@@ -69,6 +74,41 @@ class LLMEngine:
             prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params)
         self.scheduler.add(seq)
+        return seq.seq_id
+
+    def detach_request(self, seq_id: int) -> KVSnapshot:
+        if seq_id in self._detached_requests:
+            raise ValueError(f"request {seq_id} is already detached")
+        seq = next((seq for seq in self.scheduler.running if seq.seq_id == seq_id), None)
+        if seq is None:
+            raise ValueError(f"request {seq_id} is not running at a handoff boundary")
+        snapshot = export_kv(self.model_runner, seq)
+        self._detached_requests[seq_id] = seq
+        self.scheduler.running.remove(seq)
+        return snapshot
+
+    def release_detached_request(self, seq_id: int):
+        seq = self._detached_requests[seq_id]
+        self.scheduler.block_manager.deallocate(seq)
+        del self._detached_requests[seq_id]
+
+    def reattach_request(self, seq_id: int) -> int:
+        seq = self._detached_requests[seq_id]
+        self.scheduler.running.append(seq)
+        del self._detached_requests[seq_id]
+        return seq.seq_id
+
+    def resume_request(self, snapshot: KVSnapshot) -> int:
+        manager = self.scheduler.block_manager
+        seq = import_kv(self.model_runner, manager, snapshot)
+        try:
+            device = self.model_runner.kv_cache.device
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            self.scheduler.running.append(seq)
+        except Exception:
+            manager.deallocate(seq)
+            raise
         return seq.seq_id
 
     def step(self):
