@@ -11,6 +11,7 @@ from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
+from nanovllm.engine.handoff_timing import PhaseTimer
 from nanovllm.engine.kv_handoff import KVSnapshot, export_kv, import_kv
 
 
@@ -82,9 +83,13 @@ class LLMEngine:
         seq = next((seq for seq in self.scheduler.running if seq.seq_id == seq_id), None)
         if seq is None:
             raise ValueError(f"request {seq_id} is not running at a handoff boundary")
-        snapshot = export_kv(self.model_runner, seq)
-        self._detached_requests[seq_id] = seq
-        self.scheduler.running.remove(seq)
+        timer = PhaseTimer("detach_request", seq_id=seq_id)
+        with timer.phase("export"):
+            snapshot = export_kv(self.model_runner, seq)
+        with timer.phase("unschedule"):
+            self._detached_requests[seq_id] = seq
+            self.scheduler.running.remove(seq)
+        timer.finish()
         return snapshot
 
     def release_detached_request(self, seq_id: int):
@@ -100,15 +105,23 @@ class LLMEngine:
 
     def resume_request(self, snapshot: KVSnapshot) -> int:
         manager = self.scheduler.block_manager
-        seq = import_kv(self.model_runner, manager, snapshot)
+        timer = PhaseTimer("resume_request")
+        seq = None
         try:
-            device = self.model_runner.kv_cache.device
-            if device.type == "cuda":
-                torch.cuda.synchronize(device)
-            self.scheduler.running.append(seq)
-        except Exception:
-            manager.deallocate(seq)
+            with timer.phase("import"):
+                seq = import_kv(self.model_runner, manager, snapshot)
+            with timer.phase("cuda_sync"):
+                device = self.model_runner.kv_cache.device
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+            with timer.phase("admit"):
+                self.scheduler.running.append(seq)
+        except Exception as error:
+            timer.abort(error)
+            if seq is not None:
+                manager.deallocate(seq)
             raise
+        timer.finish(seq_id=seq.seq_id)
         return seq.seq_id
 
     def step(self):

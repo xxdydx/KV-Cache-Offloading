@@ -64,6 +64,29 @@ requests cannot be detached. Failed export leaves the request scheduled;
 failed import does not admit a request and releases newly allocated blocks.
 Call these methods from the engine-owning thread between inference steps.
 
+### Handoff debug timing
+
+Set `NANOVLLM_HANDOFF_DEBUG=1` (or call
+`nanovllm.engine.handoff_timing.enable()`) to emit one JSON log line per
+`detach_request`, `resume_request`, `export_kv`, and `import_kv` call on the
+`nanovllm.kv_handoff` logger:
+
+```json
+{"op": "import_kv", "num_cached_tokens": 257, "payload_bytes": 8224, "total_ms": 0.349,
+ "phases_ms": {"validate": 0.03, "rebuild_sequence": 0.011, "allocate_blocks": 0.007,
+  "copy_to_device": 0.004, "scatter_blocks": 0.262, "publish_cache": 0.025},
+ "unaccounted_ms": 0.011, "timing_overhead_ms": 0.002}
+```
+
+`phases_ms` breaks the call into its stages (gather/pack/host-copy on export;
+validate/rebuild/allocate/device-copy/scatter/publish on import),
+`unaccounted_ms` is the remainder between phases, and `timing_overhead_ms` is
+a per-process calibration of the instrumentation itself. When disabled,
+recording reduces to a boolean check and a null context per phase; lazily
+supplied fields are not evaluated. See
+[handoff_timing.py](nanovllm_upstream/nanovllm/engine/handoff_timing.py) and
+[test_handoff_timing.py](bench/test_handoff_timing.py).
+
 The minimal benchmark releases source blocks as soon as CPU export completes:
 
 ```text

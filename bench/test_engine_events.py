@@ -35,6 +35,7 @@ def api(monkeypatch):
     load("nanovllm.engine.sequence", "engine/sequence.py")
     load("nanovllm.engine.block_manager", "engine/block_manager.py")
     load("nanovllm.engine.scheduler", "engine/scheduler.py")
+    load("nanovllm.engine.handoff_timing", "engine/handoff_timing.py")
     load("nanovllm.engine.kv_handoff", "engine/kv_handoff.py")
     runner_module = ModuleType("nanovllm.engine.model_runner")
     runner_module.ModelRunner = object

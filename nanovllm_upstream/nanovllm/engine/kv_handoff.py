@@ -9,6 +9,7 @@ from dataclasses import dataclass
 
 import torch
 
+from nanovllm.engine.handoff_timing import PhaseTimer
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.sampling_params import SamplingParams
 
@@ -40,12 +41,19 @@ def export_kv(runner, seq: Sequence) -> KVSnapshot:
     if count <= 0 or count != len(seq) - 1:
         raise ValueError("export requires exactly one pending, uncached token")
     num_blocks = (count + runner.block_size - 1) // runner.block_size
-    block_ids = torch.tensor(seq.block_table[:num_blocks], dtype=torch.int64,
-                             device=runner.kv_cache.device)
-    if block_ids.numel() != num_blocks:
-        raise ValueError("sequence is missing KV blocks")
-    packed = runner.kv_cache.index_select(2, block_ids).flatten(2, 3)
-    payload = packed[:, :, :count].contiguous().cpu()
+    timer = PhaseTimer("export_kv", seq_id=seq.seq_id, num_tokens=count,
+                       num_blocks=num_blocks)
+    with timer.phase("gather_blocks"):
+        block_ids = torch.tensor(seq.block_table[:num_blocks], dtype=torch.int64,
+                                 device=runner.kv_cache.device)
+        if block_ids.numel() != num_blocks:
+            raise ValueError("sequence is missing KV blocks")
+        packed = runner.kv_cache.index_select(2, block_ids).flatten(2, 3)
+    with timer.phase("pack"):
+        dense = packed[:, :, :count].contiguous()
+    with timer.phase("copy_to_host"):
+        payload = dense.cpu()
+    timer.finish(payload_bytes=payload.numel() * payload.element_size())
     return KVSnapshot(seq.token_ids.copy(), seq.num_prompt_tokens, count,
                       runner.block_size, seq.temperature, seq.max_tokens,
                       seq.ignore_eos, payload)
@@ -78,37 +86,50 @@ def import_kv(runner, block_manager, snapshot: KVSnapshot) -> Sequence:
     """
     if runner.world_size != 1:
         raise NotImplementedError("KV handoff currently requires tensor_parallel_size=1")
-    cache = runner.kv_cache
-    expected = (2, cache.shape[1], snapshot.num_cached_tokens, *cache.shape[-2:])
-    if (snapshot.block_size != runner.block_size or block_manager.block_size != runner.block_size
-            or tuple(snapshot.kv.shape) != expected or snapshot.kv.dtype != cache.dtype
-            or snapshot.kv.device.type != "cpu"):
-        raise ValueError("snapshot layout, dtype or block size does not match this worker")
-    if (not 0 < snapshot.num_prompt_tokens < len(snapshot.token_ids)
-            or snapshot.num_cached_tokens != len(snapshot.token_ids) - 1
-            or len(snapshot.token_ids) - snapshot.num_prompt_tokens >= snapshot.max_tokens):
-        raise ValueError("snapshot must contain an unfinished completion and one uncached token")
-    seq = Sequence(snapshot.token_ids[:snapshot.num_prompt_tokens], SamplingParams(
-        temperature=snapshot.temperature, max_tokens=snapshot.max_tokens,
-        ignore_eos=snapshot.ignore_eos))
-    for token in snapshot.token_ids[snapshot.num_prompt_tokens:]:
-        seq.append_token(token)
-    block_manager.allocate_for_resume(seq, snapshot.num_cached_tokens)
+    timer = PhaseTimer("import_kv", num_cached_tokens=snapshot.num_cached_tokens,
+                       num_tokens=len(snapshot.token_ids))
+    seq = None
     try:
-        payload = snapshot.kv.to(device=cache.device)
-        for logical, physical in enumerate(seq.block_table):
-            start = logical * runner.block_size
-            end = min(start + runner.block_size, snapshot.num_cached_tokens)
-            cache[:, :, physical, :end-start].copy_(payload[:, :, start:end])
-        # Prefix metadata becomes valid only once the payload has been copied.
-        seq.num_cached_tokens = 0
-        seq.num_scheduled_tokens = snapshot.num_cached_tokens
-        block_manager.hash_blocks(seq)
-        seq.num_scheduled_tokens = 0
-        seq.num_cached_tokens = snapshot.num_cached_tokens
-        seq.status = SequenceStatus.RUNNING
-        seq.is_prefill = False
+        with timer.phase("validate"):
+            cache = runner.kv_cache
+            expected = (2, cache.shape[1], snapshot.num_cached_tokens, *cache.shape[-2:])
+            if (snapshot.block_size != runner.block_size or block_manager.block_size != runner.block_size
+                    or tuple(snapshot.kv.shape) != expected or snapshot.kv.dtype != cache.dtype
+                    or snapshot.kv.device.type != "cpu"):
+                raise ValueError("snapshot layout, dtype or block size does not match this worker")
+            if (not 0 < snapshot.num_prompt_tokens < len(snapshot.token_ids)
+                    or snapshot.num_cached_tokens != len(snapshot.token_ids) - 1
+                    or len(snapshot.token_ids) - snapshot.num_prompt_tokens >= snapshot.max_tokens):
+                raise ValueError("snapshot must contain an unfinished completion and one uncached token")
+        with timer.phase("rebuild_sequence"):
+            seq = Sequence(snapshot.token_ids[:snapshot.num_prompt_tokens], SamplingParams(
+                temperature=snapshot.temperature, max_tokens=snapshot.max_tokens,
+                ignore_eos=snapshot.ignore_eos))
+            for token in snapshot.token_ids[snapshot.num_prompt_tokens:]:
+                seq.append_token(token)
+        with timer.phase("allocate_blocks"):
+            block_manager.allocate_for_resume(seq, snapshot.num_cached_tokens)
+        with timer.phase("copy_to_device"):
+            payload = snapshot.kv.to(device=cache.device)
+        with timer.phase("scatter_blocks"):
+            for logical, physical in enumerate(seq.block_table):
+                start = logical * runner.block_size
+                end = min(start + runner.block_size, snapshot.num_cached_tokens)
+                cache[:, :, physical, :end-start].copy_(payload[:, :, start:end])
+        with timer.phase("publish_cache"):
+            # Prefix metadata becomes valid only once the payload has been copied.
+            seq.num_cached_tokens = 0
+            seq.num_scheduled_tokens = snapshot.num_cached_tokens
+            block_manager.hash_blocks(seq)
+            seq.num_scheduled_tokens = 0
+            seq.num_cached_tokens = snapshot.num_cached_tokens
+            seq.status = SequenceStatus.RUNNING
+            seq.is_prefill = False
+        timer.finish(payload_bytes=lambda: snapshot.payload_bytes,
+                     num_blocks=lambda: len(seq.block_table))
         return seq
-    except Exception:
-        block_manager.deallocate(seq)
+    except Exception as error:
+        timer.abort(error)
+        if seq is not None:
+            block_manager.deallocate(seq)
         raise
