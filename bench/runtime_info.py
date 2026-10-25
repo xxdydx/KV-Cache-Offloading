@@ -13,6 +13,11 @@ def memory_info():
                 result[name] = {k:int(v) for k,v in (line.split() for line in value.splitlines())}
             else:
                 result[name] = int(value) if value.isdigit() else value
+    path = Path("/sys/fs/cgroup/memory.stat")
+    if path.exists():
+        stats = {key: int(value) for key, value in
+                 (line.split() for line in path.read_text().splitlines())}
+        result["memory.inactive_file"] = stats.get("inactive_file", 0)
     path = Path("/proc/self/status")
     if path.exists():
         result["process_rss_kib"] = next((int(line.split()[1]) for line in path.read_text().splitlines()
