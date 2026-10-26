@@ -74,16 +74,53 @@ def measured_step(engine, emit, phase, request_ids):
     return result
 
 
-def source_loop(engine, requests, connection, limits, emit, host_budget):
-    """One source request and one transfer at a time; destination decodes independently."""
+def receive_dispatch(connection, awaiting, emit, want=None):
+    """Receive control messages until `want` arrives, filing READY receipts.
+
+    With concurrent transfers, a READY for an earlier request can arrive while
+    the source is waiting for the current request's PERMIT. Receipts are filed
+    into `awaiting` (a dict of request IDs sent but not yet acknowledged);
+    anything else that is not the wanted message is a protocol violation.
+    EOF and timeout propagate so the trial aborts with the transport reason.
+    """
+    while True:
+        message = receive_message(connection)
+        kind = message["kind"]
+        if kind == "READY":
+            request_id = message["request_id"]
+            if request_id not in awaiting:
+                raise ValueError(f"READY for unknown or already-acknowledged {request_id}")
+            sent_at = awaiting.pop(request_id)
+            emit("READY_RECEIVED", request_id=request_id, in_flight=len(awaiting),
+                 receipt_latency_s=time.perf_counter() - sent_at)
+            if want is None and not awaiting:
+                return None  # Drain complete: every sent transfer is acknowledged.
+        elif want is not None and kind == want[0] and message.get("request_id") == want[1]:
+            return message
+        else:
+            raise ValueError(f"Unexpected {kind} message")
+
+
+def source_loop(engine, requests, connection, limits, emit, host_budget, clock_origin=None):
+    """Prefill requests as they arrive; decoupled transfers let the destination
+    decode earlier requests while later prompts prefill. At most one snapshot
+    is on the wire at a time (synchronous send); READY receipts are drained
+    before STOP so the trial never reports success past an uncertain handoff.
+    """
     from nanovllm.sampling_params import SamplingParams
 
+    awaiting = {}  # Request IDs sent but not yet acknowledged by the destination.
     for request in requests:
         request_id, prompt = request["request_id"], request["prompt"]
+        arrival = request.get("arrival")
+        if clock_origin is not None and arrival is not None:
+            delay = clock_origin + arrival - time.perf_counter()
+            if delay > 0:
+                time.sleep(delay)
         emit("OFFER", request_id=request_id)
         send_message(connection, "OFFER", request_id=request_id,
                      num_prompt_tokens=len(prompt), max_tokens=limits.output_tokens)
-        receive_message(connection, "PERMIT", request_id)
+        receive_dispatch(connection, awaiting, emit, want=("PERMIT", request_id))
         # No snapshot is held while waiting for destination capacity.
         check_host_memory(limits.payload_bytes(len(prompt)), host_budget)
         manager = engine.scheduler.block_manager
@@ -113,9 +150,13 @@ def source_loop(engine, requests, connection, limits, emit, host_budget):
         start = time.perf_counter()
         send_snapshot(connection, request_id, snapshot)
         del snapshot
-        emit("SENT", request_id=request_id, start=start, end=time.perf_counter())
-        receive_message(connection, "READY", request_id)
-        emit("READY_RECEIVED", request_id=request_id)
+        awaiting[request_id] = time.perf_counter()
+        emit("SENT", request_id=request_id, start=start,
+             end=time.perf_counter(), in_flight=len(awaiting))
+    # Drain receipts before STOP: an unacknowledged handoff is an uncertain
+    # handoff, and the trial must not end ahead of its own error detection.
+    while awaiting:
+        receive_dispatch(connection, awaiting, emit)
     send_message(connection, "STOP")
 
 
@@ -270,7 +311,8 @@ def worker(role, args, channel, listener=None):
         if role == "prefill":
             connection = socket.create_connection(args.address, timeout=args.timeout)
             connection.settimeout(args.timeout)
-            source_loop(engine, args.requests, connection, limits, emit, args.host_payload_bytes)
+            source_loop(engine, args.requests, connection, limits, emit,
+                        args.host_payload_bytes, clock_origin=command.get("t0"))
         else:
             listener.settimeout(args.timeout)
             connection, _ = listener.accept()
@@ -292,12 +334,57 @@ def worker(role, args, channel, listener=None):
     emit("DONE")
 
 
+def find_gate_overlap(events):
+    """Host-interval overlaps between prefilling one request and decoding another.
+
+    The concurrency gate needs evidence that the source prefilled a request
+    while the destination decoded a *different* request. Pairs prefill STEP
+    intervals (source worker clock) with READY-to-FINISHED decode intervals
+    (destination worker clock). Same-host perf_counter clocks are comparable
+    across processes; this remains host evidence, not GPU-kernel proof.
+    """
+    # ADMITTED only: READY/FINISHED carry destination-local IDs, a different namespace.
+    local_to_request = {e["local_id"]: e["request_id"] for e in events
+                        if e["kind"] == "ADMITTED"}
+    prefill = {}
+    for event in events:
+        if event["kind"] != "STEP" or event["phase"] != "prefill":
+            continue
+        for local in event.get("request_ids", []):
+            request_id = local_to_request.get(local)
+            if request_id is None:
+                continue
+            start, end = prefill.get(request_id, (event["start"], event["end"]))
+            prefill[request_id] = (min(start, event["start"]), max(end, event["end"]))
+    decode = {}
+    ready = {e["request_id"]: e["t"] for e in events if e["kind"] == "READY"}
+    finished = {e["request_id"]: e["t"] for e in events if e["kind"] == "FINISHED"}
+    for request_id, start in ready.items():
+        end = finished.get(request_id)
+        if end is not None:
+            decode[request_id] = (start, end)
+    overlaps = []
+    for prefill_id, (prefill_start, prefill_end) in prefill.items():
+        for decode_id, (decode_start, decode_end) in decode.items():
+            if prefill_id == decode_id:
+                continue
+            duration = min(prefill_end, decode_end) - max(prefill_start, decode_start)
+            if duration > 0:
+                overlaps.append(dict(prefill_request=prefill_id,
+                                     decode_request=decode_id,
+                                     overlap_s=duration))
+    overlaps.sort(key=lambda item: -item["overlap_s"])
+    return overlaps
+
+
 def summarize(events, requests, error):
     """Measure on one same-host perf_counter clock; never call host overlap GPU proof."""
     start = next((e["t"] for e in events if e["kind"] == "START"), None)
+    submits = {e["request_id"]: e["t"] for e in events if e["kind"] == "SUBMIT"}
     rows = []
     for request in requests:
         request_id = request["request_id"]
+        origin = submits.get(request_id, start)
         tokens = sorted((e for e in events if e["kind"] == "TOKEN"
                          and e["request_id"] == request_id), key=lambda e: e["output_index"])
         complete = bool(tokens) and (len(tokens) == request["max_tokens"]
@@ -309,8 +396,8 @@ def summarize(events, requests, error):
         gaps = [b["t"] - a["t"] for a, b in zip(tokens, tokens[1:])]
         rows.append(dict(request_id=request_id, status="completed" if complete else "failed",
                          token_ids=[e["token_id"] for e in tokens],
-                         ttft_s=tokens[0]["t"] - start if tokens and start is not None else None,
-                         completion_s=tokens[-1]["t"] - start if complete else None,
+                         ttft_s=tokens[0]["t"] - origin if tokens and origin is not None else None,
+                         completion_s=tokens[-1]["t"] - origin if complete else None,
                          mean_itl_s=statistics.mean(gaps) if gaps else None,
                          max_itl_s=max(gaps) if gaps else None))
     prefill = [e for e in events if e["kind"] == "STEP" and e["phase"] == "prefill"]
@@ -318,9 +405,12 @@ def summarize(events, requests, error):
     overlap = sum(max(0, min(p["end"], d["end"]) - max(p["start"], d["start"]))
                   for p in prefill for d in decode)
     completed = [r for r in rows if r["status"] == "completed"]
-    elapsed = max((r["completion_s"] for r in completed), default=0)
+    finish_times = [e["t"] for e in events if e["kind"] == "TOKEN" and e["finished"]]
+    elapsed = max((t - start for t in finish_times), default=0) if start is not None else 0
+    gate_overlaps = find_gate_overlap(events)
     clean = {e["role"] for e in events if e["kind"] == "CLEAN" and e["used_blocks"] == 0}
     passed = error is None and len(completed) == len(requests) and clean == {"prefill", "decode"}
+    staggered = any(request.get("arrival", 0) > 0 for request in requests)
     return dict(passed=passed, error=error, trial_aborted=error is not None,
                 requests=rows, failed_requests=len(rows) - len(completed),
                 mean_ttft_s=statistics.mean(r["ttft_s"] for r in completed) if completed else None,
@@ -329,8 +419,12 @@ def summarize(events, requests, error):
                 median_completion_s=statistics.median(r["completion_s"] for r in completed) if completed else None,
                 output_tokens_per_s=len(completed) * requests[0]["max_tokens"] / elapsed if elapsed else None,
                 host_step_overlap_s=overlap, host_overlap_observed=overlap > 0,
+                gate_overlap_pairs=gate_overlaps[:5],
+                gate_overlap_observed=bool(gate_overlaps),
                 gpu_concurrency_validated=False,
-                limitations=["Two-request finite same-host diagnostic; throughput includes drain",
+                limitations=["Finite same-host diagnostic; throughput includes drain",
+                             "Synthetic staggered arrivals; not a shared open-loop serving trace"
+                             if staggered else
                              "All requests arrive together; this is not an open-loop serving trace",
                              "Host step intervals are overlap candidates; validate GPU kernels with NVTX/Nsight",
                              "No uninterrupted GPU baseline comparison in this probe",
@@ -345,9 +439,11 @@ def run(args):
     payload = 2 * config["num_hidden_layers"] * config["num_key_value_heads"] * head_dim * max(args.lengths) * 2
     check_host_memory(payload, args.host_payload_bytes)
     rng = random.Random(args.seed)
+    args.arrivals = list(args.arrivals) if args.arrivals else [0.0] * len(args.lengths)
     args.requests = [dict(request_id=f"request-{i}", prompt=[rng.randrange(config["vocab_size"])
-                        for _ in range(length)], max_tokens=args.output_tokens)
-                     for i, length in enumerate(args.lengths)]
+                        for _ in range(length)], max_tokens=args.output_tokens,
+                        arrival=arrival)
+                     for i, (length, arrival) in enumerate(zip(args.lengths, args.arrivals))]
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=False)
     (out / "inputs.json").write_text(json.dumps(args.requests))
@@ -400,9 +496,9 @@ def run(args):
                             record(dict(kind="START", t=arrival))
                             for request in args.requests:
                                 record(dict(kind="SUBMIT", request_id=request["request_id"],
-                                            t=arrival))
+                                            t=arrival + request["arrival"]))
                             for peer in channels:
-                                peer.send(dict(kind="START"))
+                                peer.send(dict(kind="START", t0=arrival))
                             deadline = time.monotonic() + args.timeout
                     if event["kind"] == "DONE":
                         done.add(channels.index(channel))
@@ -444,7 +540,10 @@ def main():
     parser.add_argument("--model", required=True)
     parser.add_argument("--out", required=True)
     parser.add_argument("--gpus", nargs=2, type=int, default=[0, 1])
-    parser.add_argument("--lengths", nargs=2, type=int, default=[512, 8192])
+    parser.add_argument("--lengths", nargs="+", type=int, default=[512, 8192],
+                        help="Prompt lengths, one per request")
+    parser.add_argument("--arrivals", nargs="+", type=float, default=None,
+                        help="Per-request arrival offsets in seconds, same count as --lengths")
     parser.add_argument("--output-tokens", type=int, default=128)
     parser.add_argument("--prefill-chunk", type=int, default=2048)
     parser.add_argument("--memory-fraction", type=float, default=0.6)
@@ -455,6 +554,7 @@ def main():
     parser.add_argument("--seed", type=int, default=20261025)
     args = parser.parse_args()
     if (min(args.lengths) < 1 or max(args.lengths) > 8192 or not 2 <= args.output_tokens <= 256
+            or len(args.lengths) < 2
             or args.gpus[0] == args.gpus[1] or min(args.gpus) < 0
             or args.init_ports[0] == args.init_ports[1]
             or not all(1024 <= p <= 65535 for p in args.init_ports)
@@ -462,7 +562,11 @@ def main():
             or not math.isfinite(args.timeout) or args.timeout <= 0
             or not math.isfinite(args.startup_timeout) or args.startup_timeout <= 0
             or not 0 < args.memory_fraction < 1):
-        parser.error("Invalid probe limits; use distinct GPUs/ports, prompts 1..8192, outputs 2..256")
+        parser.error("Invalid probe limits; use distinct GPUs/ports, 2+ prompts 1..8192, outputs 2..256")
+    if (len(args.arrivals) != len(args.lengths)
+            or not all(math.isfinite(a) and a >= 0 for a in args.arrivals)
+            or any(b < a for a, b in zip(args.arrivals, args.arrivals[1:]))):
+        parser.error("Arrivals must match --lengths count and be finite, non-negative, non-decreasing")
     args.model = str(Path(args.model).resolve())
     raise SystemExit(0 if run(args) else 1)
 

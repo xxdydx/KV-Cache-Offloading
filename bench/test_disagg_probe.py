@@ -229,6 +229,47 @@ def test_full_lifetime_reservation_waits_for_existing_decode(api, limits, monkey
     assert not destination.scheduler.block_manager.used_block_ids
 
 
+def test_source_overlaps_next_offer_with_earlier_receipt(api, limits, monkeypatch):
+    """Concurrency gate, host side: OFFER B must not wait for READY A."""
+    source, destination, _ = engines(api)
+    monkeypatch.setattr(probe, "memory_info", lambda: {})
+    requests = [dict(request_id="A", prompt=[1] * 255, max_tokens=4),
+                dict(request_id="B", prompt=[2] * 257, max_tokens=4)]
+    events = []
+    emit = lambda kind, **kw: events.append(dict(kind=kind, **kw))
+    left, right = socket.socketpair()
+    with left, right, ThreadPoolExecutor(max_workers=2) as pool:
+        left.settimeout(3)
+        right.settimeout(3)
+        decoded = pool.submit(probe.decode_loop, destination, right, limits, emit, 1024**2, 3)
+        produced = pool.submit(probe.source_loop, source, requests, left, limits, emit, 1024**2)
+        produced.result(timeout=5)
+        decoded.result(timeout=5)
+    order = [e["kind"] + ":" + e.get("request_id", "") for e in events]
+    assert order.index("SENT:A") < order.index("OFFER:B") < order.index("READY_RECEIVED:A")
+    assert order.index("OFFER:B") < order.index("FINISHED:A")
+    # Receipts are drained before source_loop returns; STOP follows on the wire
+    # (never emitted), and the destination exiting cleanly proves the ordering.
+    assert order[-1] == "READY_RECEIVED:B"
+    assert not source.scheduler.block_manager.used_block_ids
+    assert not destination.scheduler.block_manager.used_block_ids
+
+
+def test_gate_overlap_detects_prefill_during_other_request_decode():
+    events = [
+        dict(kind="ADMITTED", request_id="B", local_id=1, t=10.0),
+        dict(kind="READY", request_id="A", local_id=5, t=10.0),
+        dict(kind="FINISHED", request_id="A", t=12.0),
+        dict(kind="STEP", phase="prefill", request_ids=[1], start=10.5, end=11.5),
+        dict(kind="STEP", phase="decode", request_ids=[5], start=10.0, end=12.0),
+    ]
+    overlaps = probe.find_gate_overlap(events)
+    assert overlaps == [dict(prefill_request="B", decode_request="A", overlap_s=1.0)]
+    # Same-request prefill/decode overlap must not count: the gate is cross-request.
+    events[2]["t"] = 9.5  # decode of A ends before B's prefill starts
+    assert probe.find_gate_overlap(events) == []
+
+
 def test_import_failure_closes_connection_without_ready(api, limits, monkeypatch):
     destination = cached_engine(api, [])
     monkeypatch.setattr(probe, "memory_info", lambda: {})

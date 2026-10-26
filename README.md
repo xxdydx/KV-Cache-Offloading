@@ -113,7 +113,7 @@ adds worker loops around them. The serial benchmark remains the reference.
 
 ## Minimal concurrent handoff probe
 
-This learning prototype runs two persistent TP=1 workers on one CUDA host.
+This learning prototype runs persistent TP=1 workers on one CUDA host.
 GPU 0 prefills each request and sends its first token plus a KV snapshot;
 GPU 1 imports the snapshot and streams the remaining output tokens. A socket
 thread receives CPU data while the destination's owning thread advances decode.
@@ -126,15 +126,25 @@ Start with a small local Qwen3 checkpoint in the nano-vllm CUDA environment:
 python -m bench.disagg_probe --model /path/to/Qwen3-0.6B \
   --out /tmp/disagg-smoke --gpus 0 1 --lengths 255 257 --output-tokens 32
 
+# Staggered arrivals for the concurrency gate (GPU 0 prefills B while GPU 1 decodes A):
+python -m bench.disagg_probe --model /path/to/Qwen3-0.6B --gpus 0 1 \
+  --out /tmp/disagg-gate --lengths 255 257 259 --arrivals 0 0.5 1.0 --output-tokens 32
+
 # Larger diagnostic after the smoke test:
 python -m bench.disagg_probe --model /path/to/Qwen3-8B \
   --out /tmp/disagg-8b --gpus 0 1 --lengths 512 8192 --output-tokens 128
 ```
 
 Use a fresh output directory per run. Inputs are seeded synthetic token IDs;
-both requests arrive together after worker startup. BF16, eager execution,
-greedy sampling, and `ignore_eos=True` are fixed. Prompts are limited to 8K and
-outputs to 2–256 tokens. One transfer is in flight at a time. Before prefill,
+requests arrive per `--arrivals` offsets (simultaneous by default). BF16,
+eager execution, greedy sampling, and `ignore_eos=True` are fixed. Prompts are
+limited to 8K and outputs to 2–256 tokens. One transfer is in flight at a
+time, but the source prefills the next request while earlier transfers and
+decodes proceed: the source stops blocking on `READY` receipts, which are
+drained non-blockingly and must all arrive before `STOP`. Summary fields
+`gate_overlap_pairs` and `gate_overlap_observed` report host-interval overlap
+between prefilling one request and decoding another; they remain host
+evidence, not GPU-kernel proof. Before prefill,
 the destination grants capacity for the request's eventual full KV growth,
 waiting for existing decodes to finish if needed. This can intentionally
 serialize requests when the pool is too small.
@@ -165,7 +175,7 @@ validated in the current CPU-only development environment.
 For learning, read in this order:
 
 1. [Message framing and validation](bench/disagg_protocol.py): `OFFER → PERMIT → TRANSFER → READY`, then `STOP`.
-2. [Prefill loop](bench/disagg_probe.py): `source_loop()` calls detach, release, and send.
+2. [Prefill loop](bench/disagg_probe.py): `source_loop()` calls detach, release, and send; `receive_dispatch()` files READY receipts.
 3. [Decode loop](bench/disagg_probe.py): `decode_loop()` owns the engine; `receive_loop()` owns the socket.
 4. [CPU tests](bench/test_disagg_probe.py): bit preservation, token continuity, capacity, and failures.
 
