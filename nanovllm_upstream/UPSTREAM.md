@@ -57,9 +57,8 @@ extension commits and are not expected to run against the stock engine.
 - `nanovllm/engine/kv_handoff.py`: BF16 KV export/import and byte-exact
   validation for TP=1 workers.
 
-The parent repository contains the handoff benchmarks, tests, cost model, and
-performance experiments. These changes establish handoff correctness; they do
-not yet constitute a concurrent disaggregated serving system.
+This project extends nano-vllm's GPU prefix cache with CPU storage for inactive
+agent contexts. The CPU cache tier is not yet implemented.
 
 ## Updating or benchmarking upstream
 

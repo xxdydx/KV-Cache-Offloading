@@ -1,208 +1,138 @@
-# disaggregated-inference
+# Agent KV cache management on one GPU
 
-Adding prefill/decode-disaggregated serving to nano-vllm, optimizing KV transfers,
-and comparing the result against colocated nano-vllm and vLLM.
+**Question: when should a serving engine move an inactive agent's KV cache to
+CPU RAM so other agents can use the GPU?** Extend the existing nano-vllm engine
+and compare GPU retention, eviction/recomputation, and CPU preservation across
+multi-turn workloads.
 
-The modified engine is included directly in `nanovllm_upstream/` as ordinary
-tracked source. This is one repository: a normal clone includes both the engine
-and the experiment code, with no submodule setup.
+Weights, prefill, and active decode attention stay on the GPU. CPU memory stores
+reusable state while an agent waits for a tool. The new CPU-backed cache tier
+and agent replay harness are **not implemented yet**. The detailed implementation
+plan and acceptance gates are in `spec.md` (locally gitignored).
 
-Based on [GeeeekExplorer/nano-vllm](https://github.com/GeeeekExplorer/nano-vllm),
-starting at commit `bb823b3e06983d71485a8e1f23715ebd87d98ef8`. See
-[upstream provenance and local changes](nanovllm_upstream/UPSTREAM.md).
-The original [MIT license](nanovllm_upstream/LICENSE) is retained.
+## What the project does
 
-## Tracking changes from stock nano-vllm
-```bash
-# List engine changes since the stock snapshot, oldest first.
-git log --reverse --oneline nanovllm-stock..HEAD -- nanovllm_upstream/
-
-# See the complete engine source difference from stock.
-git diff nanovllm-stock HEAD -- nanovllm_upstream/nanovllm/
-```
-
-## Per-step token events
-
-With the modified engine installed and a local model checkpoint, requests can
-be tracked by their process-local sequence IDs and consumed one step at a time:
-
-```python
-from nanovllm import LLM, SamplingParams
-
-llm = LLM("/path/to/model")
-request_id = llm.add_request("Explain KV caching.", SamplingParams(temperature=0))
-while not llm.is_finished():
-    result = llm.step_with_events()
-    for event in result.token_events:
-        print(event.seq_id, event.output_index, event.token_id, event.finished)
-```
-
-Output indices are zero-based within each completion. Intermediate prefill
-chunks emit no token events; the final prefill chunk emits the first output
-token. The final token has `finished=True` when EOS or the output limit ends
-the request. `result.outputs` contains completed token sequences, and
-`result.num_tokens` retains the existing positive-prefill/negative-decode work
-count. Existing `step()` and `generate()` callers keep their return formats.
-Each call to either step method advances inference by one batch; token events
-report only the new output from the `step_with_events()` call that produced it.
-
-## Engine handoff methods
-
-Each worker uses its own process and a TP=1 engine. Both workers must load the
-same checkpoint and use matching KV layout, dtype, and block size.
-
-| Method | Behavior |
-| --- | --- |
-| `detach_request(seq_id)` | Export a CPU `KVSnapshot` and stop scheduling that request, retaining its source blocks |
-| `resume_request(snapshot)` | Import KV, wait for CUDA copy completion, admit the request for decode, and return its destination-local ID |
-| `release_detached_request(seq_id)` | Release retained source blocks; an independently completed CPU snapshot remains valid |
-| `reattach_request(seq_id)` | Resume scheduling the original source sequence with the same ID and existing KV |
-
-Detach between engine steps after an unfinished request has generated at least
-one output token. Queued, partially prefilled, finished, and already detached
-requests cannot be detached. Failed export leaves the request scheduled;
-failed import does not admit a request and releases newly allocated blocks.
-Call these methods from the engine-owning thread between inference steps.
-
-### Handoff debug timing
-
-Set `NANOVLLM_HANDOFF_DEBUG=1` (or call
-`nanovllm.engine.handoff_timing.enable()`) to emit one JSON log line per
-`detach_request`, `resume_request`, `export_kv`, and `import_kv` call on the
-`nanovllm.kv_handoff` logger:
-
-```json
-{"op": "import_kv", "num_cached_tokens": 257, "payload_bytes": 8224, "total_ms": 0.349,
- "phases_ms": {"validate": 0.03, "rebuild_sequence": 0.011, "allocate_blocks": 0.007,
-  "copy_to_device": 0.004, "scatter_blocks": 0.262, "publish_cache": 0.025},
- "unaccounted_ms": 0.011, "timing_overhead_ms": 0.002}
-```
-
-`phases_ms` breaks the call into its stages (gather/pack/host-copy on export;
-validate/rebuild/allocate/device-copy/scatter/publish on import),
-`unaccounted_ms` is the remainder between phases, and `timing_overhead_ms` is
-a per-process calibration of the instrumentation itself. When disabled,
-recording reduces to a boolean check and a null context per phase; lazily
-supplied fields are not evaluated. See
-[handoff_timing.py](nanovllm_upstream/nanovllm/engine/handoff_timing.py) and
-[test_handoff_timing.py](bench/test_handoff_timing.py).
-
-The minimal benchmark releases source blocks as soon as CPU export completes:
+Agents repeatedly call a model, wait for tools, append results, and call the
+model again. Their contexts grow, and keeping every inactive context on the GPU
+can limit how many agents the system can serve.
 
 ```text
-Source:       snapshot = source.detach_request(source_id)
-Source:       source.release_detached_request(source_id)
-Transport:    deliver snapshot to the destination
-Destination:  destination_id = destination.resume_request(snapshot)
-Transport:    acknowledge destination readiness to the source
+GPU: generate a turn → retain its valid KV prefix
+                              ↓
+Tool wait: keep KV on GPU / preserve on CPU / evict it
+                              ↓
+Tool result: restore or recompute prefix → prefill new input → GPU generation
 ```
 
-The destination continues output indices and the total output-token budget
-from the snapshot. Tokens generated before handoff are included in completed
-outputs but are not replayed as new token events. Source and destination IDs
-are local identifiers; a coordinator must track their relationship.
+Preserving CPU state may reduce recomputation and free GPU cache blocks, but
+transfers and restoration can increase latency. Measure the conditions where
+that tradeoff helps, including cases where GPU retention or recomputation wins.
+CPU attention is no longer the implementation target.
 
-Reattach only when the destination is known not to have accepted the request;
-reattaching after an uncertain delivery can execute the request twice. Release
-and reattach consume the detached handle and reject repeated calls. Engine
-shutdown also releases retained source blocks. `is_finished()` describes the
-local scheduling queues, so it can be true while detached blocks remain owned.
+## First implementation task
 
-These methods provide the engine boundary. The two-request prototype below
-adds worker loops around them. The serial benchmark remains the reference.
+**Measure the prefix caching that already exists.** Run a completed turn, submit
+an extended prompt, and count reused versus newly prefilled tokens. Then create
+GPU-block pressure and observe when that reuse disappears.
 
-## Minimal concurrent handoff probe
+Nano-vllm hashes full KV blocks by token prefix. Completion releases request
+references but leaves reusable block data and hash metadata until another
+allocation recycles those blocks. Matching later requests can reuse them. The
+default blocks contain 256 tokens; partial tails are recomputed, and admission
+leaves the last prompt block for processing. Basic cross-turn reuse therefore
+does not require a new cache handle.
 
-This learning prototype runs persistent TP=1 workers on one CUDA host.
-GPU 0 prefills each request and sends its first token plus a KV snapshot;
-GPU 1 imports the snapshot and streams the remaining output tokens. A socket
-thread receives CPU data while the destination's owning thread advances decode.
-Only the owning thread calls the engine. The engine source is unchanged by
-this prototype.
+The extension is a CPU-backed tier that preserves selected reusable prefixes
+before GPU recycling destroys them, then restores them for later turns. Start
+with full blocks and recompute tails. Explicit session pinning and partial-tail
+reuse are optional later features. The existing detach/resume API is useful
+transfer machinery, but it handles an unfinished request and cannot simply
+export an already-finished request's released blocks.
 
-Start with a small local Qwen3 checkpoint in the nano-vllm CUDA environment:
+Read these files in order, under `nanovllm_upstream/nanovllm/`:
 
-```sh
-python -m bench.disagg_probe --model /path/to/Qwen3-0.6B \
-  --out /tmp/disagg-smoke --gpus 0 1 --lengths 255 257 --output-tokens 32
+1. [`engine/llm_engine.py`](nanovllm_upstream/nanovllm/engine/llm_engine.py): requests, token events, existing handoff boundaries.
+2. [`engine/scheduler.py`](nanovllm_upstream/nanovllm/engine/scheduler.py): scheduling, completion, and release.
+3. [`engine/block_manager.py`](nanovllm_upstream/nanovllm/engine/block_manager.py): block references, reuse, and allocation.
+4. [`engine/kv_handoff.py`](nanovllm_upstream/nanovllm/engine/kv_handoff.py): valid KV export/import and snapshot validation.
+5. [`engine/model_runner.py`](nanovllm_upstream/nanovllm/engine/model_runner.py): cache layout and GPU execution.
 
-# Staggered arrivals for the concurrency gate (GPU 0 prefills B while GPU 1 decodes A):
-python -m bench.disagg_probe --model /path/to/Qwen3-0.6B --gpus 0 1 \
-  --out /tmp/disagg-gate --lengths 255 257 259 --arrivals 0 0.5 1.0 --output-tokens 32
+The next gates are synchronous CPU preservation, two-agent replay with the three
+policies, pressure/wait-duration sweeps, and one profiled optimization. The
+implementation belongs in the engine and a minimal replay harness; no external
+agent framework or second GPU is needed.
 
-# Larger diagnostic after the smoke test:
-python -m bench.disagg_probe --model /path/to/Qwen3-8B \
-  --out /tmp/disagg-8b --gpus 0 1 --lengths 512 8192 --output-tokens 128
+## Starting files
+
+```text
+nanovllm_upstream/       Existing engine, upstream docs, license, provenance
+bench/inventory.py      Hardware and visible sandbox-limit manifest
+bench/baseline.py       GPU-only phase diagnostic and fixed-batch controls
+bench/workload_sweep.py GPU load / KV memory diagnostic (not an agent replay)
+bench/metrics.py        Reusable token-latency calculations
+bench/test_*.py         Engine and measurement regression tests
+spec.md                Active plan plus collapsed historical specifications
+results/               Preserved evidence, source snapshots, and new runs
 ```
 
-Use a fresh output directory per run. Inputs are seeded synthetic token IDs;
-requests arrive per `--arrivals` offsets (simultaneous by default). BF16,
-eager execution, greedy sampling, and `ignore_eos=True` are fixed. Prompts are
-limited to 8K and outputs to 2–256 tokens. One transfer is in flight at a
-time, but the source prefills the next request while earlier transfers and
-decodes proceed: the source stops blocking on `READY` receipts, which are
-drained non-blockingly and must all arrive before `STOP`. Summary fields
-`gate_overlap_pairs` and `gate_overlap_observed` report host-interval overlap
-between prefilling one request and decoding another; they remain host
-evidence, not GPU-kernel proof. Before prefill,
-the destination grants capacity for the request's eventual full KV growth,
-waiting for existing decodes to finish if needed. This can intentionally
-serialize requests when the pool is too small.
+The standalone CPU-attention probe and its tests were removed after a verified
+backup. Recovery paths and hashes are in
+[the scope-change manifest](results/2026-11-04-agent-kv-scope/manifest.json).
+The earlier multi-GPU drivers/cost model were already archived. Keep engine
+handoff APIs and their tests: their ownership and transfer checks are useful
+building blocks for the new cache manager.
 
-The source releases its GPU blocks after completed CPU export, then drops its
-CPU payload after synchronous send completes. The receiver drops its payload
-after completed import. The default 3 GiB payload budget covers both host
-copies; cgroup memory preflight also reserves headroom and accounts for inactive
-file cache. These estimates do not guarantee allocation success or bound all
-process/OS memory. Socket timeout, import error, cancellation via interrupt,
-or worker failure aborts the trial and terminates workers. There is no retry,
-source fallback, reconnect, or transparent crash recovery.
+## Hardware and existing evidence
 
-Outputs include `inputs.json`, `manifest.json`, raw `events.jsonl`,
-`summary.json`, and a Chrome/Perfetto `timeline.json`. Token indices retain the
-handoff gap in ITL. Summary latency includes source admission waiting; throughput
-includes drain. `passed` checks output accounting and successful block cleanup;
-it does not establish token equality with an uninterrupted GPU baseline.
-Failed/aborted trials remain recorded and return a nonzero exit status.
+The completed November 4 check used an RTX 6000 Ada (49,140 MiB reported VRAM),
+Ryzen 9 9900X (12 physical cores / 24 logical CPUs), and **49 GiB effective cgroup
+RAM**, even though the host reported about 123 GiB. That task and the earlier
+home RTX 4000 task are stopped; recheck any new allocation. The Mac is for
+editing, CPU tests, analysis, and backups.
 
-Host step overlap is only a candidate for GPU overlap. Local CUDA durations
-and NVTX ranges are included; use a GPU profiler before declaring the M1 GPU
-concurrency gate passed. Per-step CUDA events/synchronization add instrumentation
-overhead. This is a two-request mechanism diagnostic, not a sustained-capacity
-or competitive performance result. No GPU run of this prototype has been
-validated in the current CPU-only development environment.
+Qwen3-0.6B BF16 inference and transfers ran successfully. PyTorch GPU timelines
+work; hardware-counter profiling was denied with `ERR_NVGPUCTRPERM`. The prior
+[feasibility report](results/2026-11-04-office-rtx-feasibility/report.md) contains
+GPU baselines, the slower CPU-attention result, raw data, and source snapshots.
+It does not demonstrate a benefit from agent cache management. Restore its
+source snapshot into a separate directory to reproduce removed experiments.
 
-For learning, read in this order:
+On the next GPU host, first save inventory and run a short GPU diagnostic using
+the pinned checkpoint. Prepare a compatible CUDA environment using the
+[recorded dependency setup](results/2026-11-04-office-rtx-feasibility/reproduce.md).
+From the repository root, in that environment:
 
-1. [Message framing and validation](bench/disagg_protocol.py): `OFFER → PERMIT → TRANSFER → READY`, then `STOP`.
-2. [Prefill loop](bench/disagg_probe.py): `source_loop()` calls detach, release, and send; `receive_dispatch()` files READY receipts.
-3. [Decode loop](bench/disagg_probe.py): `decode_loop()` owns the engine; `receive_loop()` owns the socket.
-4. [CPU tests](bench/test_disagg_probe.py): bit preservation, token continuity, capacity, and failures.
+```bash
+python -m bench.inventory --out results/agent-kv-inventory-01.json
 
-The benchmark driver represents submission with `SUBMIT` events. Token and
-completion events travel over process pipes, not the raw KV socket. An extra
-`PERMIT` exchange bounds destination/host allocations; `READY` confirms import.
-
-```sh
-python3 -m pytest -q bench/test_disagg_probe.py bench/test_engine_events.py \
-  bench/test_engine_handoff.py bench/test_kv_wire.py bench/test_metrics.py \
-  bench/test_sampler.py costmodel/test_model.py
+CUDA_VISIBLE_DEVICES=0 python -m bench.baseline \
+  --model /path/to/pinned/Qwen3-0.6B \
+  --out results/agent-kv-gpu-baseline-01 \
+  --batch-size 1 --prompt-tokens 128 --output-tokens 32
 ```
 
-## Research Question
+Use a new output path per run. These are diagnostic tools. Agent replay and
+cross-turn cache behavior remain the work to implement.
 
-**Question:** when does shipping KV state between machines beat keeping a request on one GPU, and how far can a purpose-built transfer path cut that cost?
+## Evaluation and local checks
 
-- Model: Qwen3-8B (BF16, ~144 KB KV/token)
-- Development pairing: two RTX 6000 Ada GPUs (48 GB each) on one host
+Use the existing GPU-only prefix cache as the main baseline. Forced eviction /
+recomputation is an explicit diagnostic control, not a substitute for that
+baseline. Compare policies on identical growing contexts, tool waits, arrivals,
+model/precision, and resource budgets. Primary metrics are completed trajectories
+per minute, end-to-end agent latency, turn/resume latency, recomputed input,
+bytes moved, and live/free cache blocks. Count queueing and all failures. Include
+low-pressure and short-wait cases; a throughput gain is a hypothesis.
 
-## Layout
+Run existing CPU regressions from the root in an environment with PyTorch,
+Transformers, xxhash, NumPy, tqdm, and pytest:
 
-| Path | Contents |
-| --- | --- |
-| `nanovllm_upstream/` | Vendored nano-vllm engine, including local handoff and sampling changes |
-| `microbench/` | Week-1 network and hardware microbenchmarks (iperf3, ping-pong, PCIe, matmul, power) |
-| `costmodel/` | Analytical disaggregation cost model and tests |
-| `results/` | Experiment data and figures; new artifacts are currently gitignored |
-| `bench/` | Scripts that regenerate every figure from `results/` |
+```bash
+python3 -m pytest -q bench
+```
 
+These tests cover existing engine and measurement behavior. New cross-turn
+retention, CPU-tier policy, and agent-harness checks must be added during
+implementation. See [upstream provenance](nanovllm_upstream/UPSTREAM.md).
+`spec.md` and new `results/` stay locally ignored; package them explicitly for
+sharing. Original source and all historical results remain attributed.

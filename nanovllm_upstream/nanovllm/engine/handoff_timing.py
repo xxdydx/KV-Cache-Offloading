@@ -26,7 +26,7 @@ from contextlib import nullcontext
 
 logger = logging.getLogger("nanovllm.kv_handoff")
 
-_ENABLED = os.environ.get("NANOVLLM_HANDOFF_DEBUG", "") not in ("", "0")
+_ENABLED = False
 _PHASE_COST_S = None
 
 
@@ -39,6 +39,11 @@ def enable(enabled: bool = True):
         handler.setFormatter(logging.Formatter("%(message)s"))
         logger.addHandler(handler)
         logger.setLevel(logging.DEBUG)
+
+
+# Environment activation must go through enable() so the stderr handler and
+# DEBUG level are attached; a bare module flag alone would swallow records.
+enable(os.environ.get("NANOVLLM_HANDOFF_DEBUG", "") not in ("", "0"))
 
 
 def is_enabled() -> bool:
