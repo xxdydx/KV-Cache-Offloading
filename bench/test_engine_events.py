@@ -34,6 +34,7 @@ def api(monkeypatch):
     load("nanovllm.config", "config.py")
     load("nanovllm.engine.sequence", "engine/sequence.py")
     load("nanovllm.engine.block_manager", "engine/block_manager.py")
+    load("nanovllm.engine.cpu_prefix_cache", "engine/cpu_prefix_cache.py")
     load("nanovllm.engine.scheduler", "engine/scheduler.py")
     load("nanovllm.engine.handoff_timing", "engine/handoff_timing.py")
     load("nanovllm.engine.kv_handoff", "engine/kv_handoff.py")

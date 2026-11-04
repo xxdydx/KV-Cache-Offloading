@@ -58,7 +58,8 @@ extension commits and are not expected to run against the stock engine.
   validation for TP=1 workers.
 
 This project extends nano-vllm's GPU prefix cache with CPU storage for inactive
-agent contexts. The CPU cache tier is not yet implemented.
+agent contexts. Full-block CPU save/restore and opt-in automatic preservation
+before recycling and restoration during admission are implemented.
 
 ## Updating or benchmarking upstream
 

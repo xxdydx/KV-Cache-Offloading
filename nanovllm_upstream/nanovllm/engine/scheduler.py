@@ -26,48 +26,80 @@ class Scheduler:
         scheduled_seqs = []
         num_batched_tokens = 0
 
-        # prefill
-        while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
-            seq = self.waiting[0]
-            remaining = self.max_num_batched_tokens - num_batched_tokens
-            if remaining == 0:
-                break
-            if not seq.block_table:
-                num_cached_blocks = self.block_manager.can_allocate(seq)
-                if num_cached_blocks == -1:
+        # Prefill copies may fail before model execution. Keep all requests
+        # and their references retryable, including earlier admissions in a batch.
+        prefill_states = []
+        removed_waiting = []
+        try:
+            while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
+                seq = self.waiting[0]
+                remaining = self.max_num_batched_tokens - num_batched_tokens
+                if remaining == 0:
                     break
-                num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
-            else:
-                num_tokens = seq.num_tokens - seq.num_cached_tokens
-            if remaining < num_tokens and scheduled_seqs:  # only allow chunked prefill for the first seq
-                break
-            if not seq.block_table:
-                self.block_manager.allocate(seq, num_cached_blocks)
-            seq.num_scheduled_tokens = min(num_tokens, remaining)
-            num_batched_tokens += seq.num_scheduled_tokens
-            if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
-                seq.status = SequenceStatus.RUNNING
-                self.waiting.popleft()
-                self.running.append(seq)
-            scheduled_seqs.append(seq)
+                prefill_states.append((seq, seq.num_cached_tokens, seq.num_scheduled_tokens,
+                                       seq.status, bool(seq.block_table)))
+                if not seq.block_table:
+                    num_cached_blocks = self.block_manager.can_allocate(seq)
+                    if num_cached_blocks == -1:
+                        break
+                    num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
+                else:
+                    num_tokens = seq.num_tokens - seq.num_cached_tokens
+                if remaining < num_tokens and scheduled_seqs:  # only allow chunked prefill for the first seq
+                    break
+                if not seq.block_table:
+                    self.block_manager.allocate(seq, num_cached_blocks)
+                seq.num_scheduled_tokens = min(num_tokens, remaining)
+                num_batched_tokens += seq.num_scheduled_tokens
+                if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
+                    seq.status = SequenceStatus.RUNNING
+                    self.waiting.popleft()
+                    removed_waiting.append(seq)
+                    self.running.append(seq)
+                scheduled_seqs.append(seq)
+
+        except BaseException:
+            for seq, cached, scheduled, status, had_blocks in reversed(prefill_states):
+                if not had_blocks and seq.block_table:
+                    self.block_manager.deallocate(seq)
+                seq.num_cached_tokens = cached
+                seq.num_scheduled_tokens = scheduled
+                seq.status = status
+            for seq in removed_waiting:
+                self.running.remove(seq)
+            self.waiting.extendleft(reversed(removed_waiting))
+            raise
 
         if scheduled_seqs:
             return scheduled_seqs, True
 
-        # decode
-        while self.running and len(scheduled_seqs) < self.max_num_seqs:
-            seq = self.running.popleft()
-            while not self.block_manager.can_append(seq):
-                if self.running:
-                    self.preempt(self.running.pop())
+        # Decode growth can also recycle a cached block. Roll back unpublished
+        # tail reservations if preservation fails anywhere in this batch.
+        decode_states = []
+        try:
+            while self.running and len(scheduled_seqs) < self.max_num_seqs:
+                seq = self.running.popleft()
+                while not self.block_manager.can_append(seq):
+                    if self.running:
+                        self.preempt(self.running.pop())
+                    else:
+                        self.preempt(seq)
+                        break
                 else:
-                    self.preempt(seq)
-                    break
-            else:
-                seq.num_scheduled_tokens = 1
-                seq.is_prefill = False
-                self.block_manager.may_append(seq)
-                scheduled_seqs.append(seq)
+                    decode_states.append((seq, len(seq.block_table), seq.num_scheduled_tokens, seq.is_prefill))
+                    seq.num_scheduled_tokens = 1
+                    seq.is_prefill = False
+                    self.block_manager.may_append(seq)
+                    scheduled_seqs.append(seq)
+        except BaseException:
+            for seq, old_length, scheduled, is_prefill in reversed(decode_states):
+                for block_id in reversed(seq.block_table[old_length:]):
+                    self.block_manager._release_block(block_id)
+                del seq.block_table[old_length:]
+                seq.num_scheduled_tokens = scheduled
+                seq.is_prefill = is_prefill
+            self.running.extendleft(reversed([seq for seq, *_ in decode_states]))
+            raise
         assert scheduled_seqs
         self.running.extendleft(reversed(scheduled_seqs))
         return scheduled_seqs, False

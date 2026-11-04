@@ -13,6 +13,7 @@ from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
 from nanovllm.engine.handoff_timing import PhaseTimer
 from nanovllm.engine.kv_handoff import KVSnapshot, export_kv, import_kv
+from nanovllm.engine.cpu_prefix_cache import CPUBlockCache
 
 
 @dataclass(frozen=True)
@@ -59,9 +60,13 @@ class LLMEngine:
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
         self._detached_requests: dict[int, Sequence] = {}
+        self._cpu_prefix_cache: CPUBlockCache | None = None
         atexit.register(self.exit)
 
     def exit(self):
+        cache = getattr(self, "_cpu_prefix_cache", None)
+        if cache is not None:
+            cache.close()
         for seq_id in tuple(self._detached_requests):
             self.release_detached_request(seq_id)
         self.model_runner.call("exit")
@@ -76,6 +81,21 @@ class LLMEngine:
         seq = Sequence(prompt, sampling_params)
         self.scheduler.add(seq)
         return seq.seq_id
+
+    def create_cpu_prefix_cache(self, max_bytes: int, *, automatic: bool = False) -> CPUBlockCache:
+        """Create this engine's bounded TP=1 CPU block cache.
+
+        automatic=True preserves idle blocks before recycling and restores CPU
+        hits during admission. Copies are synchronous. Manual calls and cache
+        configuration belong on the engine-owning thread between steps.
+        """
+        existing = getattr(self, "_cpu_prefix_cache", None)
+        if existing is not None and not existing.closed:
+            raise RuntimeError("this engine already has a CPU prefix cache")
+        cache = CPUBlockCache(self.model_runner, self.scheduler.block_manager, max_bytes,
+                              automatic=automatic)
+        self._cpu_prefix_cache = cache
+        return cache
 
     def detach_request(self, seq_id: int) -> KVSnapshot:
         if seq_id in self._detached_requests:

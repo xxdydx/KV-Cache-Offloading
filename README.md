@@ -6,8 +6,9 @@ and compare GPU retention, eviction/recomputation, and CPU preservation across
 multi-turn workloads.
 
 Weights, prefill, and active decode attention stay on the GPU. CPU memory stores
-reusable state while an agent waits for a tool. The new CPU-backed cache tier
-and agent replay harness are **not implemented yet**. The detailed implementation
+reusable state while an agent waits for a tool. Full-block CPU save/restore and
+opt-in automatic preservation/restoration are implemented. Agent replay and
+policy/performance evaluation remain to be implemented. The detailed implementation
 plan and acceptance gates are in `spec.md` (locally gitignored).
 
 ## What the project does
@@ -29,11 +30,7 @@ transfers and restoration can increase latency. Measure the conditions where
 that tradeoff helps, including cases where GPU retention or recomputation wins.
 CPU attention is no longer the implementation target.
 
-## First implementation task
-
-**Measure the prefix caching that already exists.** Run a completed turn, submit
-an extended prompt, and count reused versus newly prefilled tokens. Then create
-GPU-block pressure and observe when that reuse disappears.
+## CPU block cache
 
 Nano-vllm hashes full KV blocks by token prefix. Completion releases request
 references but leaves reusable block data and hash metadata until another
@@ -42,12 +39,55 @@ default blocks contain 256 tokens; partial tails are recomputed, and admission
 leaves the last prompt block for processing. Basic cross-turn reuse therefore
 does not require a new cache handle.
 
-The extension is a CPU-backed tier that preserves selected reusable prefixes
-before GPU recycling destroys them, then restores them for later turns. Start
-with full blocks and recompute tails. Explicit session pinning and partial-tail
-reuse are optional later features. The existing detach/resume API is useful
-transfer machinery, but it handles an unfinished request and cannot simply
-export an already-finished request's released blocks.
+Enable automatic preservation and restoration once on an initialized TP=1 engine:
+
+```python
+cpu_cache = llm.create_cpu_prefix_cache(max_bytes=8 * 1024**3, automatic=True)
+```
+
+The allocator saves valid idle blocks before recycling their GPU slots. Request
+admission checks GPU and CPU prefixes, protects every GPU hit, and restores CPU
+hits into blocks owned by the new request. No manual save/restore calls are needed.
+Copies are synchronous. Active requests still need enough GPU KV space.
+
+The CPU store uses a fixed payload budget. Once full, it keeps existing entries
+and skips additional saves; GPU eviction and recomputation continue normally.
+It does not implement CPU LRU eviction yet. `cpu_cache.stats` reports cumulative
+`saved_blocks`, `restored_blocks`, and `budget_skips`. `close()` disables the
+hooks and releases the CPU store; engine shutdown also closes it. Unexpected
+copy errors propagate with admission reservations/queues rolled back.
+
+### Manual operations
+
+Without `automatic=True`, the cache remains manually managed.
+Save a published full block before its GPU slot is reused, then restore it by
+prefix hash. Each block includes both K/V and every model layer. For an already
+initialized TP=1 `llm`, this synthetic example saves the first full block:
+
+```python
+from nanovllm import SamplingParams
+
+manager = llm.scheduler.block_manager
+prompt_ids = [1] * (manager.block_size + 1)
+llm.generate([prompt_ids], SamplingParams(temperature=0, max_tokens=1), use_tqdm=False)
+key = manager.compute_hash(prompt_ids[:manager.block_size])
+
+cpu_cache = llm.create_cpu_prefix_cache(max_bytes=64 * 1024**2)
+cpu_cache.save_block(key)
+# Other requests may now recycle the original GPU block.
+cpu_cache.restore_block(key)
+cpu_cache.discard(key)  # Release the CPU copy when no longer needed.
+```
+
+Call between engine steps on the owning thread. Restoring an existing GPU hit
+is a no-op; a restored entry remains normally recyclable. The CPU copy is kept
+until `discard`, `clear`, or engine shutdown. The byte budget covers KV tensors,
+not Python metadata; exceeding it raises `MemoryError` without evicting entries.
+Copy failures release reservations and do not publish incomplete GPU state.
+Tests in [test_cpu_prefix_cache.py](bench/test_cpu_prefix_cache.py) and
+[test_automatic_cpu_cache.py](bench/test_automatic_cpu_cache.py) force block
+recycling, check exact bytes, and verify reduced next-turn prefill. The CUDA
+case runs when a device is available; CPU tests use a scripted model runner.
 
 Read these files in order, under `nanovllm_upstream/nanovllm/`:
 
@@ -57,8 +97,7 @@ Read these files in order, under `nanovllm_upstream/nanovllm/`:
 4. [`engine/kv_handoff.py`](nanovllm_upstream/nanovllm/engine/kv_handoff.py): valid KV export/import and snapshot validation.
 5. [`engine/model_runner.py`](nanovllm_upstream/nanovllm/engine/model_runner.py): cache layout and GPU execution.
 
-The next gates are synchronous CPU preservation, two-agent replay with the three
-policies, pressure/wait-duration sweeps, and one profiled optimization. The
+The next steps are real-GPU validation, two-agent replay, and policy/performance evaluation. The
 implementation belongs in the engine and a minimal replay harness; no external
 agent framework or second GPU is needed.
 
