@@ -172,8 +172,10 @@ def test_failed_preservation_does_not_pop_or_invalidate_victim(api, monkeypatch)
     assert_pool_consistent(manager)
 
 
-def test_prefill_batch_restore_failure_rolls_back_all_admissions(api, monkeypatch):
-    engine = cached_engine(api, [[10], [20], [90], [13, 14]], budget=1024, num_blocks=4)
+@pytest.mark.parametrize("policy", ["legacy", "fixed", "decode_aware"])
+def test_prefill_batch_restore_failure_rolls_back_all_admissions(api, monkeypatch, policy):
+    engine = cached_engine(api, [[10], [20], [90], [13, 14]], budget=1024, num_blocks=4,
+                           prefill_policy=policy, prefill_chunk_size=1024)
     manager = engine.scheduler.block_manager
     engine.add_request([1] * 257, params(api, max_tokens=1))
     engine.step_with_events()
@@ -214,8 +216,10 @@ def test_prefill_batch_restore_failure_rolls_back_all_admissions(api, monkeypatc
     assert_pool_consistent(manager)
 
 
-def test_decode_growth_failure_restores_queue_and_tail_reservations(api, monkeypatch):
-    engine = cached_engine(api, [[80], [81], [10, 20], [11, 21]], budget=512, num_blocks=4)
+@pytest.mark.parametrize("policy", ["legacy", "fixed", "decode_aware"])
+def test_decode_growth_failure_restores_queue_and_tail_reservations(api, monkeypatch, policy):
+    engine = cached_engine(api, [[80], [81], [10, 20], [11, 21]], budget=512, num_blocks=4,
+                           prefill_policy=policy, prefill_chunk_size=512)
     manager = engine.scheduler.block_manager
     for value in (7, 8):
         engine.add_request([value] * 256, params(api, max_tokens=1))

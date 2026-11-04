@@ -60,6 +60,10 @@ extension commits and are not expected to run against the stock engine.
 This project extends nano-vllm's GPU prefix cache with CPU storage for inactive
 agent contexts. Full-block CPU save/restore and opt-in automatic preservation
 before recycling and restoration during admission are implemented.
+Opt-in fixed/decode-aware prefill budgets interleave separate prefill and decode
+batches, with decode rotation and partial-prefill reclamation under KV pressure.
+The default retains prefill priority. Scheduler decisions are exposed for
+mixed-workload measurements.
 
 ## Updating or benchmarking upstream
 

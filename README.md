@@ -8,7 +8,8 @@ multi-turn workloads.
 Weights, prefill, and active decode attention stay on the GPU. CPU memory stores
 reusable state while an agent waits for a tool. Full-block CPU save/restore and
 opt-in automatic preservation/restoration are implemented. Agent replay and
-policy/performance evaluation remain to be implemented. The detailed implementation
+policy/performance evaluation remain to be implemented. Opt-in prefill scheduling
+policies also interleave decode with bounded prefill chunks. The detailed implementation
 plan and acceptance gates are in `spec.md` (locally gitignored).
 
 ## What the project does
@@ -101,6 +102,68 @@ The next steps are real-GPU validation, two-agent replay, and policy/performance
 implementation belongs in the engine and a minimal replay harness; no external
 agent framework or second GPU is needed.
 
+## Prefill scheduling
+
+A long prompt can delay requests already generating tokens. The existing engine
+chunks prefill at `max_num_batched_tokens` but prioritizes waiting prefills.
+Three policies are now selectable at engine construction:
+
+| `prefill_policy` | Behavior |
+| --- | --- |
+| `legacy` (default) | Existing prefill priority and hard batch-token limit |
+| `fixed` | Fixed prefill chunk budget; give decode a batch between prefill batches |
+| `decode_aware` | Same interleaving; shrink the chunk budget as runnable decode count grows |
+
+```python
+from nanovllm import LLM
+
+llm = LLM(
+    "/path/to/pinned/Qwen3-0.6B",
+    prefill_policy="decode_aware",
+    prefill_chunk_size=512,
+    prefill_min_chunk_size=32,
+    max_num_batched_tokens=4096,
+)
+```
+
+The adaptive budget is `max(min_chunk, chunk_size // (1 + runnable_decoders))`,
+capped by `max_num_batched_tokens`. Both opt-in policies alternate **separate**
+prefill and decode batches when both phases can progress; they do not combine
+phases in one kernel launch. Without runnable decoders, prefills run consecutively.
+Decode batches rotate when there are more resident requests than batch slots.
+Under KV pressure, partial-prefill reservations can be reclaimed for decode
+growth; that request may need to recompute its prefix. Long requests retain FIFO
+prefill order and progress when capacity permits. `scheduler.last_schedule`
+records the phase, chosen budget, decode load, tokens, and request IDs.
+
+These are token-budget heuristics, not wall-clock latency guarantees. Context
+length, batch size, and synchronous CPU-cache transfers still affect step time.
+Tests cover chunk limits, interleaving, progress, memory pressure, output events,
+CPU-cache integration, and copy-failure retries. GPU latency results are pending.
+
+Run the mixed short/long arrival benchmark in a fresh GPU process for each policy:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m bench.prefill_scheduling \
+  --model /path/to/pinned/Qwen3-0.6B \
+  --policy decode_aware --chunk-size 512 --min-chunk-size 32 \
+  --out results/prefill-decode-aware-01
+```
+
+Repeat with `--policy legacy` and `--policy fixed`, using new output directories
+and identical workload/resource arguments. Sweep chunk size and repeat each
+configuration before drawing tail-latency conclusions. The harness records the
+seeded workload/hash, hardware/source manifest, raw scheduling/token events,
+per-group TTFT and inter-token percentiles, completion/wait latency, and achieved
+throughput. Arrival delay during a running step counts toward latency. Verify
+`contended_prefill_steps` is nonzero; otherwise increase initial output length or
+reduce the arrival delay. All requests must complete within the timeout.
+
+This scheduling benchmark checks worst-case KV capacity up front to isolate
+scheduling from memory-pressure preemption. Its synthetic independent requests
+do not measure multi-turn agent cache benefits. CPU-cache and agent-replay
+experiments remain separate evaluations.
+
 ## Starting files
 
 ```text
@@ -108,6 +171,7 @@ nanovllm_upstream/       Existing engine, upstream docs, license, provenance
 bench/inventory.py      Hardware and visible sandbox-limit manifest
 bench/baseline.py       GPU-only phase diagnostic and fixed-batch controls
 bench/workload_sweep.py GPU load / KV memory diagnostic (not an agent replay)
+bench/prefill_scheduling.py Mixed-length arrivals and scheduling-policy metrics
 bench/metrics.py        Reusable token-latency calculations
 bench/test_*.py         Engine and measurement regression tests
 spec.md                Active plan plus collapsed historical specifications

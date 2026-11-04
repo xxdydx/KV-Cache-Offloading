@@ -57,12 +57,14 @@ class ScriptedRunner:
         return tokens
 
 
-def make_engine(api, batches, budget=8, num_blocks=16):
+def make_engine(api, batches, budget=8, num_blocks=16, **config_kwargs):
     engine = api.LLMEngine.__new__(api.LLMEngine)
-    engine.scheduler = api.Scheduler(SimpleNamespace(
+    config = dict(
         max_num_seqs=4, max_num_batched_tokens=budget, eos=99,
         kvcache_block_size=256, num_kvcache_blocks=num_blocks,
-    ))
+    )
+    config.update(config_kwargs)
+    engine.scheduler = api.Scheduler(SimpleNamespace(**config))
     engine._detached_requests = {}
     engine.model_runner = ScriptedRunner(batches)
     engine.tokenizer = SimpleNamespace(

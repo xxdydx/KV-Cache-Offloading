@@ -8,8 +8,8 @@ import torch
 from bench.test_engine_events import api, make_engine, params
 
 
-def cached_engine(api, batches, budget=512, num_blocks=16):
-    engine = make_engine(api, batches, budget=budget, num_blocks=num_blocks)
+def cached_engine(api, batches, budget=512, num_blocks=16, **config_kwargs):
+    engine = make_engine(api, batches, budget=budget, num_blocks=num_blocks, **config_kwargs)
     runner = engine.model_runner
     runner.world_size = 1
     runner.block_size = 256

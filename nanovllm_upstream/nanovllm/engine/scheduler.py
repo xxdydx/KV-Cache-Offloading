@@ -1,8 +1,19 @@
 from collections import deque
+from dataclasses import dataclass
 
-from nanovllm.config import Config
+from nanovllm.config import Config, validate_scheduling_options
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.block_manager import BlockManager
+
+
+@dataclass(frozen=True)
+class ScheduleDecision:
+    policy: str
+    phase: str
+    prefill_budget: int
+    decode_requests: int  # Runnable decoders before admission/preemption.
+    scheduled_tokens: int
+    seq_ids: tuple[int, ...]
 
 
 class Scheduler:
@@ -10,6 +21,13 @@ class Scheduler:
     def __init__(self, config: Config):
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
+        self.prefill_policy = getattr(config, "prefill_policy", "legacy")
+        self.prefill_chunk_size = getattr(config, "prefill_chunk_size", 512)
+        self.prefill_min_chunk_size = getattr(config, "prefill_min_chunk_size", 1)
+        validate_scheduling_options(self.prefill_policy, self.prefill_chunk_size,
+                                    self.prefill_min_chunk_size,
+                                    self.max_num_batched_tokens, self.max_num_seqs)
+        self.last_schedule: ScheduleDecision | None = None
         self.eos = config.eos
         self.block_size = config.kvcache_block_size
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
@@ -23,6 +41,44 @@ class Scheduler:
         self.waiting.append(seq)
 
     def schedule(self) -> tuple[list[Sequence], bool]:
+        """Time-slice homogeneous prefill/decode batches; keep runner APIs intact.
+
+        Opt-in policies allow at most one prefill batch between decode batches
+        when both phases can progress. This is a work budget, not a latency SLO.
+        """
+        decode_requests = len(self.running)
+        budget = self.max_num_batched_tokens
+        if self.prefill_policy != "legacy":
+            chunk = self.prefill_chunk_size
+            if self.prefill_policy == "decode_aware":
+                chunk = max(self.prefill_min_chunk_size, chunk // (1 + decode_requests))
+            budget = min(budget, chunk)
+
+        decode_due = (self.prefill_policy != "legacy" and self.running
+                      and self.last_schedule is not None
+                      and self.last_schedule.phase == "prefill")
+        phases = (False, True) if decode_due else (True, False)
+        for is_prefill in phases:
+            seqs = self._schedule_prefill(budget) if is_prefill else self._schedule_decode()
+            if seqs:
+                self.last_schedule = ScheduleDecision(
+                    self.prefill_policy, "prefill" if is_prefill else "decode", budget,
+                    decode_requests, sum(seq.num_scheduled_tokens for seq in seqs),
+                    tuple(seq.seq_id for seq in seqs))
+                return seqs, is_prefill
+
+        # Decode may preempt every candidate, making a formerly blocked prefill
+        # admissible. Retry once rather than returning an empty engine step.
+        seqs = self._schedule_prefill(budget)
+        if seqs:
+            self.last_schedule = ScheduleDecision(
+                self.prefill_policy, "prefill", budget, decode_requests,
+                sum(seq.num_scheduled_tokens for seq in seqs),
+                tuple(seq.seq_id for seq in seqs))
+            return seqs, True
+        raise RuntimeError("no request can progress: check GPU KV capacity and request lengths")
+
+    def _schedule_prefill(self, budget: int) -> list[Sequence]:
         scheduled_seqs = []
         num_batched_tokens = 0
 
@@ -33,7 +89,7 @@ class Scheduler:
         try:
             while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
                 seq = self.waiting[0]
-                remaining = self.max_num_batched_tokens - num_batched_tokens
+                remaining = budget - num_batched_tokens
                 if remaining == 0:
                     break
                 prefill_states.append((seq, seq.num_cached_tokens, seq.num_scheduled_tokens,
@@ -70,9 +126,10 @@ class Scheduler:
             self.waiting.extendleft(reversed(removed_waiting))
             raise
 
-        if scheduled_seqs:
-            return scheduled_seqs, True
+        return scheduled_seqs
 
+    def _schedule_decode(self) -> list[Sequence]:
+        scheduled_seqs = []
         # Decode growth can also recycle a cached block. Roll back unpublished
         # tail reservations if preservation fails anywhere in this batch.
         decode_states = []
@@ -80,6 +137,13 @@ class Scheduler:
             while self.running and len(scheduled_seqs) < self.max_num_seqs:
                 seq = self.running.popleft()
                 while not self.block_manager.can_append(seq):
+                    # Interleaving leaves partial prefills resident in waiting.
+                    # Reclaim those reservations before evicting live decoders;
+                    # otherwise a long partial prompt can prevent all progress.
+                    partial = next((item for item in reversed(self.waiting) if item.block_table), None)
+                    if self.prefill_policy != "legacy" and partial is not None:
+                        self.block_manager.deallocate(partial)
+                        continue
                     if self.running:
                         self.preempt(self.running.pop())
                     else:
@@ -100,9 +164,12 @@ class Scheduler:
                 seq.is_prefill = is_prefill
             self.running.extendleft(reversed([seq for seq, *_ in decode_states]))
             raise
-        assert scheduled_seqs
-        self.running.extendleft(reversed(scheduled_seqs))
-        return scheduled_seqs, False
+        if self.prefill_policy == "legacy":
+            self.running.extendleft(reversed(scheduled_seqs))
+        else:
+            # More resident requests than batch slots must all get decode time.
+            self.running.extend(scheduled_seqs)
+        return scheduled_seqs
 
     def preempt(self, seq: Sequence):
         seq.status = SequenceStatus.WAITING
