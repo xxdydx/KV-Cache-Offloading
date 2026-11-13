@@ -6,8 +6,9 @@
 Agents are overwhelmingly I/O bound— they call the model, wait for a tool, then call it again, as the context keeps increasing. During the wait, their KV cache sits idle on the GPU. Once the agents' combined context outgrows GPU memory, a serving engine evicts that KV and recomputes the whole prefix on the next turn. 
 
 This project keeps the idle KV in
-CPU RAM instead: it saves blocks as their GPU slots are reclaimed, prefetches
-them back during the tool wait, and stores them in FP8.
+CPU RAM instead: it saves blocks as their GPU slots are reclaimed, stores them
+in FP8, and restores them in the background while a returning agent waits for
+GPU space.
 
 On Qwen3-8B with one RTX 6000 Ada, this gives **+58–71% completed agent
 trajectories per minute** over GPU-only prefix caching. It **matches or slightly
@@ -34,7 +35,7 @@ Compared directly with vLLM's offloading, this repo is +3.9% ± 1.3 and
 +2.5% ± 1.4 faster, winning all 3 seeds in both workloads. The two engines'
 GPU-only baselines are within 1.6% of each other.
 
-### Long-horizon agents: where it matters
+### Performance improvements for long-horizon agents
 
 Median time to first token per turn on the 12-turn workload (Qwen3-8B):
 
@@ -74,18 +75,24 @@ turn ends ──► KV blocks released on GPU (still hashed, still reusable)
                 │
    GPU slot reclaimed ──► block saved to pinned CPU memory (BF16 or FP8)
                 │
-   tool wait ──► prefix prefetched back into free GPU blocks
+   next turn arrives, blocked on GPU space ──► CPU hits prefetched into spare GPU blocks
                 │
-   next turn ──► GPU hit or CPU restore; only the new tokens are prefilled
+   admitted ──► GPU hits (incl. prefetched) + CPU restores; only new tokens are prefilled
 ```
 
 The tier is implemented in the engine (scheduler, block manager and copy
-path),
+path):
 
 - **Save on release.** A block is copied out only when its GPU slot is about to
   be reused.
-- **Prefetch.** A waiting agent's prefix is restored into idle GPU blocks
-  before its next turn arrives, hiding the copy latency.
+- **Prefetch.** When a returning agent's request is blocked waiting for GPU
+  space, its prompt is already known, so the engine hashes it block by block
+  and restores the CPU hits into spare GPU blocks in the background. On
+  admission those are ordinary GPU hits and need no copy. Prefetch never takes
+  blocks from running requests, and it keeps one block per running request
+  for decode growth. It may recycle other agents' idle cached blocks, which are
+  saved to CPU first, so they move down a tier rather than being lost. It runs
+  only for the blocked request at the head of the queue, never speculatively.
 - **FP8 storage.** The e4m3 payload has one scale per token and KV head. That
   halves PCIe bytes and doubles CPU capacity. On Wikitext, perplexity changes
   by less than 0.3% at 2K–32K context.
@@ -96,8 +103,11 @@ path),
   using costs measured on the machine. This removes the loss on short prefixes,
   where recomputing is cheaper than copying.
 - **Optional extras.** MRU eviction keeps whole released prefixes instead of
-  losing their heads under LRU, and a client prefetch hint lets the caller
-  start a restore before the request arrives. Both help only short contexts.
+  losing their heads under LRU. A client hint (`llm.prefetch_prefix(tokens)`)
+  lets an agent framework start the restore during the tool wait, before the
+  request arrives, since it knows the next prompt starts with the agent's
+  previous context. Hints are ignored while any request is waiting for
+  admission. Both help only short contexts.
 
 ### Correctness
 
@@ -119,7 +129,7 @@ cache = llm.create_cpu_prefix_cache(
     24 * 1024**3,          # CPU budget in bytes
     automatic=True,        # save/restore inside the allocator; no manual calls
     save_on_release=True,  # copy out only when a GPU slot is reclaimed
-    prefetch=True,         # restore waiting prefixes into idle GPU blocks
+    prefetch=True,         # restore a blocked request's CPU hits into spare GPU blocks
     split_streams=True,    # separate save and restore CUDA streams
     fp8=True,              # FP8 CPU storage
 )
