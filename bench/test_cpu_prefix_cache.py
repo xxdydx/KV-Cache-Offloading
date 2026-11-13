@@ -1,5 +1,7 @@
 """Full-block CPU preservation using real cache/scheduler code and CPU tensors."""
 
+import sys
+
 import pytest
 import torch
 
@@ -304,3 +306,48 @@ def test_close_releases_pool_references_and_engine_exit_closes_cache(api):
     engine.exit()
     assert replacement.closed and replacement.bytes_used == 0
     assert calls == ["exit"]
+
+
+def test_discarded_slots_are_reused_without_new_host_allocation(api, monkeypatch):
+    engine, manager, key = completed_prefix(api, [[90], [91]])
+    cache = new_cache(engine)
+    assert cache.reserved_bytes == 0
+    assert cache.save_block(key)
+    assert cache.reserved_bytes == cache.block_bytes
+    overwrite_prefix(api, engine)
+    other = manager.compute_hash([3] * 256)
+    assert cache.discard(key)
+
+    def fail_allocation(*args, **kwargs):
+        raise AssertionError("a free slot must be reused")
+
+    monkeypatch.setattr(torch, "empty", fail_allocation)
+    assert cache.save_block(other)
+    assert cache.reserved_bytes == cache.bytes_used == cache.block_bytes
+
+
+def test_preallocated_multi_slab_slots_round_trip_byte_exact(api, monkeypatch):
+    monkeypatch.setattr(sys.modules["nanovllm.engine.cpu_prefix_cache"], "_SLAB_CHUNK_BYTES", 1)
+    engine, manager, key = completed_prefix(api, [[90], [91]])
+    pool = engine.model_runner.kv_cache
+    cache = engine.create_cpu_prefix_cache(max_bytes=3 * pool[:, :, 0].numel() * pool.element_size(),
+                                           preallocate=True)
+    assert len(cache._slabs) == 3 and cache.reserved_bytes == 3 * cache.block_bytes
+    expected = {key: pool[:, :, manager.hash_to_block_id[key]].contiguous().view(torch.uint8).clone()}
+    cache.save_block(key)
+    overwrite_prefix(api, engine)
+    other = manager.compute_hash([3] * 256)
+    expected[other] = pool[:, :, manager.hash_to_block_id[other]].contiguous().view(torch.uint8).clone()
+    cache.save_block(other)
+    assert cache._entries[key].slot != cache._entries[other].slot
+    for prefix_hash, data in expected.items():
+        manager.hash_to_block_id.pop(prefix_hash, None)
+        restored = cache.restore_block(prefix_hash)
+        assert torch.equal(pool[:, :, restored].contiguous().view(torch.uint8), data)
+
+
+def test_save_on_release_requires_automatic_mode(api):
+    engine, _, _ = completed_prefix(api)
+    with pytest.raises(ValueError, match="automatic"):
+        engine.create_cpu_prefix_cache(max_bytes=1 << 20, save_on_release=True)
+    assert getattr(engine, "_cpu_prefix_cache", None) is None

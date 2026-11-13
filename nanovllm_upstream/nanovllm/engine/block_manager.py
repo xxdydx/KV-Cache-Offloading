@@ -33,6 +33,9 @@ class BlockManager:
         self.free_block_ids: deque[int] = deque(range(num_blocks))
         self.used_block_ids: set[int] = set()
         self._cpu_prefix_cache = None
+        self._last_prefetch = None
+        # Set by the scheduler while the head waiting request cannot be admitted.
+        self.admission_blocked = False
 
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
@@ -42,7 +45,7 @@ class BlockManager:
         h.update(np.array(token_ids).tobytes())
         return h.intdigest()
 
-    def _allocate_block(self) -> int:
+    def _allocate_block(self, order_writes: bool = True) -> int:
         # Preserve before removing the free slot or invalidating its metadata.
         # Unexpected copy failures leave this candidate available and indexed.
         block_id = self.free_block_ids[0]
@@ -52,21 +55,31 @@ class BlockManager:
             if self._cpu_prefix_cache is not None:
                 self._cpu_prefix_cache._preserve_before_recycle(block.hash)
             del self.hash_to_block_id[block.hash]
+        if order_writes and self._cpu_prefix_cache is not None:
+            self._cpu_prefix_cache.before_block_reuse(block_id)
         self.free_block_ids.popleft()
         block.reset()
         self.used_block_ids.add(block_id)
         return block_id
 
     def _deallocate_block(self, block_id: int):
-        assert self.blocks[block_id].ref_count == 0
+        block = self.blocks[block_id]
+        assert block.ref_count == 0
         self.used_block_ids.remove(block_id)
         self.free_block_ids.append(block_id)
+        # Optionally start saving idle published blocks now, while the
+        # copy can overlap later steps, rather than when they are recycled.
+        if (self._cpu_prefix_cache is not None and block.hash != -1
+                and self.hash_to_block_id.get(block.hash) == block_id):
+            self._cpu_prefix_cache._preserve_on_release(block.hash)
 
     def _acquire_block(self, block_id: int):
         block = self.blocks[block_id]
         if block.ref_count == 0:
             self.free_block_ids.remove(block_id)
             self.used_block_ids.add(block_id)
+            if self._cpu_prefix_cache is not None:
+                self._cpu_prefix_cache.before_block_use(block_id)
         block.ref_count += 1
 
     def _release_block(self, block_id: int):
@@ -80,9 +93,11 @@ class BlockManager:
     ) -> int:
         """Reserve, populate, then publish a full recyclable prefix-cache block.
 
-        The callback must finish copying and establishing readiness before
-        returning. Failure frees the destination without publishing its hash;
-        previous idle contents may already be overwritten. Call between steps.
+        The callback must finish copying, or order the copy after pending
+        copies on its own stream and make later readers wait (as the CPU
+        cache's copy stream does). Failure frees the destination without
+        publishing its hash; previous idle contents may already be
+        overwritten. Call between steps.
         """
         tokens = list(token_ids)
         if (type(prefix_hash) is not int or not 0 <= prefix_hash < 2**64
@@ -96,7 +111,7 @@ class BlockManager:
             return existing
         if not self.free_block_ids:
             raise MemoryError("not enough free KV blocks to restore a prefix")
-        block_id = self._allocate_block()
+        block_id = self._allocate_block(order_writes=False)
         block = self.blocks[block_id]
         try:
             copy_to_block(block_id)
@@ -113,20 +128,72 @@ class BlockManager:
             self._deallocate_block(block_id)
         return block_id
 
-    def _prefix_blocks(self, seq: Sequence):
-        """Contiguous GPU/CPU hits; no copies or pool mutations during lookup."""
-        h = -1
-        prefix = []
-        for i in range(seq.num_blocks - 1):
+    def _full_block_hashes(self, seq: Sequence, count: int):
+        """(chained hash, token list, token tuple) for a sequence's leading blocks.
+
+        Tokens are append-only, so results stay valid. Memoizing keeps the
+        scheduler's per-step admission retry from re-hashing a long waiting
+        prompt (about 0.6 ms per step for a 17K-token prompt).
+        """
+        memo = getattr(seq, "_block_hash_memo", None)
+        if memo is None:
+            memo = seq._block_hash_memo = []
+        h = memo[-1][0] if memo else -1
+        for i in range(len(memo), count):
             token_ids = seq.block(i)
             h = self.compute_hash(token_ids, h)
+            memo.append((h, token_ids, tuple(token_ids)))
+        return memo
+
+    def prefetch(self, seq: Sequence, reserve: int = 0) -> int:
+        """Start background restores of a waiting request's CPU hits; return how many.
+
+        Restored blocks become ordinary idle GPU hits, so admission can skip
+        their copies. Uses only free blocks beyond `reserve` (kept for running
+        requests' growth) and never recycles this request's own idle GPU hits.
+        Requires a CPU cache created with prefetch=True. Call between steps.
+        """
+        cache = self._cpu_prefix_cache
+        if cache is None or not cache.prefetch_enabled:
+            return 0
+        key = (seq.seq_id, len(self.free_block_ids))
+        if key == self._last_prefetch:
+            return 0  # Nothing changed since the last attempt.
+        self._last_prefetch = key
+        prefix = self._prefix_blocks(seq)
+        own_idle = [block_id for _, _, block_id, _ in prefix
+                    if block_id is not None and self.blocks[block_id].ref_count == 0]
+        budget = len(self.free_block_ids) - reserve - len(own_idle)
+        if budget <= 0 or all(entry is None for *_, entry in prefix):
+            return 0
+        # Recycle other idle blocks first: move this request's hits to the back.
+        for block_id in own_idle:
+            self.free_block_ids.remove(block_id)
+            self.free_block_ids.append(block_id)
+        started = 0
+        for h, token_ids, block_id, entry in prefix:
+            if started == budget:
+                break
+            if entry is not None:
+                self.restore_cached_block(h, token_ids,
+                                          lambda target, e=entry: cache._copy_entry(e, target, wait=False))
+                started += 1
+        cache._prefetched_blocks += started
+        return started
+
+    def _prefix_blocks(self, seq: Sequence):
+        """Contiguous GPU/CPU hits; no copies or pool mutations during lookup."""
+        prefix = []
+        memo = self._full_block_hashes(seq, seq.num_blocks - 1)
+        for i in range(seq.num_blocks - 1):
+            h, token_ids, token_tuple = memo[i]
             block_id = self.hash_to_block_id.get(h)
             if block_id is not None:
                 if self.blocks[block_id].hash != h or self.blocks[block_id].token_ids != token_ids:
                     break
                 prefix.append((h, token_ids, block_id, None))
                 continue
-            entry = (self._cpu_prefix_cache._entry_for(h, token_ids)
+            entry = (self._cpu_prefix_cache._entry_for(h, token_tuple)
                      if self._cpu_prefix_cache is not None else None)
             if entry is None:
                 break

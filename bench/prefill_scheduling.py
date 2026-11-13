@@ -6,6 +6,7 @@ Synchronized host timestamps include scheduling, KV copies and model execution.
 
 import argparse
 import atexit
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 import hashlib
 import importlib.util
@@ -54,8 +55,60 @@ def distribution_ms(values):
     return {f"p{q}": 1000 * percentile(values, q) if values else None for q in (50, 95, 99)}
 
 
+@contextmanager
+def fixed_output_replay(llm, requests, by_id, outputs):
+    """TP=1 diagnostic: real model/KV work, prescribed generated token histories.
+
+    The runner still computes logits and samples. Only its returned IDs are
+    replaced before scheduler postprocessing; subsequent decode sees the same
+    tokens under every policy. This is not a generation-quality measurement.
+    """
+    if outputs is None:
+        yield
+        return
+    if set(outputs) != {item.name for item in requests}:
+        raise ValueError("output reference must cover exactly the workload requests")
+    for item in requests:
+        tokens = outputs[item.name]
+        if len(tokens) != item.output_tokens or any(type(token) is not int or token < 0 for token in tokens):
+            raise ValueError("output reference has invalid tokens or output length")
+    if getattr(llm.model_runner, "world_size", 1) != 1:
+        raise ValueError("fixed-output replay supports TP=1 only")
+    original = llm.model_runner.call
+
+    def call(method, *args):
+        predicted = original(method, *args)
+        if method != "run":
+            return predicted
+        seqs, _ = args
+        if len(predicted) != len(seqs):
+            raise RuntimeError("runner returned the wrong output count")
+        # Intermediate prefill predictions are discarded by the scheduler.
+        return [outputs[by_id[seq.seq_id]][seq.num_completion_tokens] for seq in seqs]
+
+    llm.model_runner.call = call
+    try:
+        yield
+    finally:
+        llm.model_runner.call = original
+
+
 def run_workload(llm, requests, sampling_params, synchronize, *, clock=time.perf_counter,
-                 sleep=time.sleep, timeout_s=120, trace=None):
+                 sleep=time.sleep, timeout_s=120, trace=None, forced_outputs=None):
+    by_id = {}
+    if forced_outputs is not None:
+        for item in requests:
+            if not sampling_params(item.output_tokens).ignore_eos:
+                raise ValueError("fixed-output replay requires ignore_eos=True")
+    with fixed_output_replay(llm, requests, by_id, forced_outputs):
+        result = _run_workload(llm, requests, sampling_params, synchronize, clock=clock,
+                               sleep=sleep, timeout_s=timeout_s, trace=trace, by_id=by_id)
+    result["summary"]["generation_mode"] = "fixed_output_replay" if forced_outputs is not None else "greedy"
+    return result
+
+
+def _run_workload(llm, requests, sampling_params, synchronize, *, clock, sleep,
+                  timeout_s, trace, by_id):
     """Measure real event APIs; injectable clock/runner permit deterministic tests.
 
     Arrivals crossed during a model step are submitted at the next boundary.
@@ -72,7 +125,7 @@ def run_workload(llm, requests, sampling_params, synchronize, *, clock=time.perf
     if not llm.is_finished():
         raise ValueError("engine must be idle before a measured workload")
     pending = sorted(requests, key=lambda item: item.arrival_s)
-    by_id, records, steps = {}, {}, []
+    records, steps = {}, []
     trace = trace if trace is not None else []
     synchronize()
     start = clock()
@@ -188,6 +241,10 @@ def main():
     parser.add_argument("--arrival-gap-ms", type=nonnegative_float, default=5)
     parser.add_argument("--timeout-s", type=positive_int, default=120)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--warmup-runs", type=positive_int, default=1,
+                        help="Unmeasured mixed workloads with distinct prefixes before collection")
+    parser.add_argument("--output-reference", type=Path,
+                        help="Diagnostic fixed-output replay using a prior result.json for this workload")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.6)
     parser.add_argument("--cpu-cache-gib", type=nonnegative_float, default=0,
                         help="Optional automatic CPU prefix cache, same budget for policy comparisons")
@@ -208,12 +265,28 @@ def main():
                   args.long_prompt + args.output_tokens, args.short_prompt + args.output_tokens)
     if max_len > model_config["max_position_embeddings"]:
         parser.error("prompt plus output exceeds checkpoint context limit")
-    requests = make_workload(
+    workload_kwargs = dict(
         vocab_size=model_config["vocab_size"], seed=args.seed,
         initial_requests=args.initial_requests, initial_prompt=args.initial_prompt,
         initial_output=args.initial_output, pairs=args.pairs, short_prompt=args.short_prompt,
         long_prompt=args.long_prompt, output_tokens=args.output_tokens,
         start_delay_s=args.start_delay_ms / 1000, arrival_gap_s=args.arrival_gap_ms / 1000)
+    requests = make_workload(**workload_kwargs)
+    workload = [asdict(item) for item in requests]
+    workload_hash = hashlib.sha256(json.dumps(workload, sort_keys=True).encode()).hexdigest()
+    forced_outputs = None
+    if args.output_reference is not None:
+        reference = json.loads(args.output_reference.read_text())
+        reference_manifest = json.loads((args.output_reference.parent / "manifest.json").read_text())
+        if (reference_manifest["workload_sha256"] != workload_hash
+                or reference_manifest["model_config"] != model_config):
+            parser.error("output reference has a different workload or model configuration")
+        forced_outputs = {name: row["token_ids"] for name, row in reference["requests"].items()}
+        if (set(forced_outputs) != {item.name for item in requests}
+                or any(len(forced_outputs[item.name]) != item.output_tokens
+                       or any(type(token) is not int or not 0 <= token < model_config["vocab_size"]
+                              for token in forced_outputs[item.name]) for item in requests)):
+            parser.error("output reference has invalid requests, token IDs, or budgets")
 
     import torch
     if not torch.cuda.is_available():
@@ -227,17 +300,23 @@ def main():
     from nanovllm import LLM, SamplingParams
 
     args.out.mkdir(parents=True)
-    workload = [asdict(item) for item in requests]
     save_json(args.out / "workload.json", workload)
+    if forced_outputs is not None:
+        save_json(args.out / "reference-output-tokens.json", forced_outputs)
     save_json(args.out / "manifest.json", {
         "args": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
-        "workload_sha256": hashlib.sha256(json.dumps(workload, sort_keys=True).encode()).hexdigest(),
+        "workload_sha256": workload_hash,
+        "generation_mode": "fixed_output_replay" if forced_outputs is not None else "greedy",
+        "output_reference_sha256": (hashlib.sha256(args.output_reference.read_bytes()).hexdigest()
+                                    if args.output_reference is not None else None),
         "inventory": collect(), "model_config": model_config,
         "engine_sha256": {str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
                           for path in sorted(root.rglob("*.py"))},
         "limitations": ["Synthetic mixed-length requests, not multi-turn agent replay or a cache-benefit benchmark.",
                          "Synchronized host step times include scheduler, copy, sampling and execution overhead.",
                          "Arrival timestamps count delay until the next engine boundary; no arrival is reset on submission.",
+                         "Unmeasured mixed-workload warmups use different seeds/prefixes to exercise changing decode batch sizes.",
+                         "Fixed-output replay, if enabled, replaces sampled IDs after real model execution and is not a quality measurement.",
                          "Chunk token budgets are heuristics, not wall-clock latency guarantees.",
                          "Use multiple fresh-process repetitions; verify contended_prefill_steps is nonzero."]})
     llm = LLM(str(args.model.resolve()), tensor_parallel_size=1,
@@ -258,12 +337,24 @@ def main():
             raise RuntimeError("workload exceeds worst-case KV capacity; reduce requests/context or raise GPU budget")
         # Warm both execution paths before timing; use a separate deterministic prefix.
         llm.generate([[1, 2, 3]], SamplingParams(temperature=0, ignore_eos=True, max_tokens=2), use_tqdm=False)
+        # A singleton warmup misses batch-size-dependent startup costs. Exercise
+        # the actual arrival/chunk pattern too, without warming measured prefixes.
+        for trial in range(args.warmup_runs):
+            warmup_seed = args.seed + 100000 + trial
+            warmup_requests = make_workload(**{**workload_kwargs, "seed": warmup_seed})
+            warmup_result = run_workload(
+                llm, warmup_requests,
+                lambda count: SamplingParams(temperature=0, ignore_eos=True, max_tokens=count),
+                torch.cuda.synchronize, timeout_s=args.timeout_s)
+            save_json(args.out / f"warmup-{trial:02d}.json",
+                      {"seed": warmup_seed, **warmup_result})
         if args.cpu_cache_gib:
             llm.create_cpu_prefix_cache(int(args.cpu_cache_gib * 1024**3), automatic=True)
         torch.cuda.reset_peak_memory_stats()
         result = run_workload(llm, requests,
                               lambda count: SamplingParams(temperature=0, ignore_eos=True, max_tokens=count),
-                              torch.cuda.synchronize, timeout_s=args.timeout_s, trace=trace)
+                              torch.cuda.synchronize, timeout_s=args.timeout_s, trace=trace,
+                              forced_outputs=forced_outputs)
         result["summary"].update(peak_allocated_bytes=torch.cuda.max_memory_allocated(),
                                   peak_reserved_bytes=torch.cuda.max_memory_reserved())
         save_json(args.out / "result.json", result)

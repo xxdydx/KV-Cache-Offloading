@@ -48,6 +48,7 @@ class Scheduler:
         """
         decode_requests = len(self.running)
         budget = self.max_num_batched_tokens
+        self.block_manager.admission_blocked = False
         if self.prefill_policy != "legacy":
             chunk = self.prefill_chunk_size
             if self.prefill_policy == "decode_aware":
@@ -97,6 +98,9 @@ class Scheduler:
                 if not seq.block_table:
                     num_cached_blocks = self.block_manager.can_allocate(seq)
                     if num_cached_blocks == -1:
+                        # Use the wait: copy its CPU hits into spare blocks now.
+                        self.block_manager.admission_blocked = True
+                        self.block_manager.prefetch(seq, reserve=len(self.running))
                         break
                     num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
                 else:

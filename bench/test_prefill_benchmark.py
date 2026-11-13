@@ -136,3 +136,50 @@ def test_invalid_workload_is_rejected(api, workload):
     engine, clock = measured_engine(api, "fixed")
     with pytest.raises(ValueError):
         measure(api, engine, clock, workload)
+
+
+@pytest.mark.parametrize("policy", ["legacy", "fixed", "decode_aware"])
+def test_fixed_output_replay_uses_real_runner_and_identical_decode_history(api, policy):
+    engine, clock = measured_engine(api, policy)
+    original = engine.model_runner.call
+    seen = []
+
+    def observe(method, seqs, is_prefill):
+        seen.extend((seq.num_completion_tokens, seq.last_token) for seq in seqs)
+        return original(method, seqs, is_prefill)
+
+    engine.model_runner.call = observe
+    workload = [Request("one", "long", 0, [1] * 5, 3)]
+    result = measure(api, engine, clock, workload, forced_outputs={"one": [99, 82, 83]})
+    assert result["requests"]["one"]["token_ids"] == [99, 82, 83]
+    assert result["summary"]["generation_mode"] == "fixed_output_replay"
+    assert result["summary"]["processed_prefill_tokens"] == 5
+    assert (1, 99) in seen and (2, 82) in seen  # Prescribed IDs reach real decode.
+    assert engine.model_runner.call is observe  # Hook is temporary.
+    assert len(engine.model_runner.calls) >= 3
+
+
+def test_fixed_output_replay_restores_runner_after_failure(api):
+    engine, clock = measured_engine(api, "fixed")
+    original = engine.model_runner.call
+    workload = [Request("one", "long", 0, [1] * 5, 3)]
+    with pytest.raises(TimeoutError):
+        measure(api, engine, clock, workload, timeout_s=0.001,
+                forced_outputs={"one": [80, 81, 82]})
+    assert engine.model_runner.call == original
+
+
+@pytest.mark.parametrize("outputs", [{}, {"other": [1]}, {"one": []}, {"one": [-1]}, {"one": [True]}])
+def test_invalid_fixed_output_stream_is_rejected_before_admission(api, outputs):
+    engine, clock = measured_engine(api, "fixed")
+    with pytest.raises(ValueError, match="output reference"):
+        measure(api, engine, clock, [Request("one", "short", 0, [1], 1)], forced_outputs=outputs)
+    assert engine.is_finished()
+
+
+def test_fixed_output_replay_requires_ignore_eos(api):
+    engine, clock = measured_engine(api, "fixed")
+    with pytest.raises(ValueError, match="ignore_eos"):
+        run_workload(engine, [Request("one", "short", 0, [1], 1)],
+                     lambda count: params(api, max_tokens=count), lambda: None,
+                     clock=clock, sleep=clock.sleep, forced_outputs={"one": [99]})

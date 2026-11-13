@@ -82,18 +82,25 @@ class LLMEngine:
         self.scheduler.add(seq)
         return seq.seq_id
 
-    def create_cpu_prefix_cache(self, max_bytes: int, *, automatic: bool = False) -> CPUBlockCache:
+    def create_cpu_prefix_cache(self, max_bytes: int, *, automatic: bool = False,
+                                save_on_release: bool = False, preallocate: bool = False,
+                                prefetch: bool = False) -> CPUBlockCache:
         """Create this engine's bounded TP=1 CPU block cache.
 
         automatic=True preserves idle blocks before recycling and restores CPU
-        hits during admission. Copies are synchronous. Manual calls and cache
-        configuration belong on the engine-owning thread between steps.
+        hits during admission; save_on_release=True saves them as soon as they
+        become idle instead; prefetch=True restores a blocked waiting
+        request's CPU hits in the background. On CUDA, copies run on a dedicated stream ordered
+        by events; preallocate=True pins the whole budget up front. Manual
+        calls and cache configuration belong on the engine-owning thread
+        between steps.
         """
         existing = getattr(self, "_cpu_prefix_cache", None)
         if existing is not None and not existing.closed:
             raise RuntimeError("this engine already has a CPU prefix cache")
         cache = CPUBlockCache(self.model_runner, self.scheduler.block_manager, max_bytes,
-                              automatic=automatic)
+                              automatic=automatic, save_on_release=save_on_release,
+                              preallocate=preallocate, prefetch=prefetch)
         self._cpu_prefix_cache = cache
         return cache
 

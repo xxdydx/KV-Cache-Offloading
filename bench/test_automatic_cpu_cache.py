@@ -34,6 +34,19 @@ def write_scheduled_kv(engine):
     engine.model_runner.call = run
 
 
+def slow_copies(cache):
+    """Delay every background copy so missing stream ordering corrupts bytes reliably."""
+    for name in ("save_block", "_copy_entry"):
+        original = getattr(cache, name)
+
+        def delayed(*args, _original=original, **kwargs):
+            with torch.cuda.stream(cache._copy_stream):
+                torch.cuda._sleep(20_000_000)
+            return _original(*args, **kwargs)
+
+        setattr(cache, name, delayed)
+
+
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 def test_automatic_save_restore_and_next_turn_without_manual_calls(api, device):
     if device == "cuda" and not torch.cuda.is_available():
@@ -321,3 +334,110 @@ def test_cpu_hits_do_not_make_an_oversized_active_request_fit(api):
     assert manager.can_allocate(seq) == -1  # Three GPU pages needed, pool has two.
     assert (list(manager.free_block_ids), cache.stats) == before
     assert not seq.block_table
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda", "cuda-slow-copies"])
+def test_save_on_release_saves_idle_blocks_before_recycling_overwrites_them(api, device):
+    slow = device == "cuda-slow-copies"
+    device = "cuda" if slow else device
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA device unavailable")
+    engine = cached_engine(api, [[10], [11], [90], [12]], num_blocks=2)
+    engine.model_runner.kv_cache = engine.model_runner.kv_cache.to(device)
+    pool = engine.model_runner.kv_cache
+    manager = engine.scheduler.block_manager
+    size = pool[:, :, 0].numel() * pool.element_size()
+    cache = engine.create_cpu_prefix_cache(max_bytes=size, automatic=True, save_on_release=True)
+    if slow:
+        slow_copies(cache)
+    write_scheduled_kv(engine)
+    engine.add_request([1] * 257, params(api, max_tokens=2))
+    engine.step_with_events()
+    engine.add_request([3] * 257, params(api, max_tokens=1))
+    engine.step_with_events()  # [3] waits for blocks while [1] decodes, then [1] releases.
+    key = manager.compute_hash([1] * 256)
+    # Saved at release, while the GPU copy is still a valid hit.
+    assert key in cache and key in manager.hash_to_block_id
+    assert cache.stats["saved_blocks"] == 1
+    expected = pool[:, :, manager.hash_to_block_id[key]].contiguous().cpu().view(torch.uint8).clone()
+    # Admitting [3] recycles the source block; the pending save must win the race.
+    engine.step_with_events()
+    assert engine.is_finished() and key not in manager.hash_to_block_id
+    engine.add_request([1] * 257 + [10, 11] + [2] * 10, params(api, max_tokens=1))
+    assert engine.step_with_events().num_tokens == 13
+    target = manager.hash_to_block_id[key]
+    assert torch.equal(pool[:, :, target].contiguous().cpu().view(torch.uint8), expected)
+    assert cache.stats["saved_blocks"] == cache.stats["restored_blocks"] == 1
+    assert not manager.used_block_ids
+    assert_pool_consistent(manager)
+
+
+def test_save_on_release_waits_for_blocked_admission(api):
+    engine = cached_engine(api, [[10], [11]], num_blocks=4)
+    pool = engine.model_runner.kv_cache
+    size = pool[:, :, 0].numel() * pool.element_size()
+    cache = engine.create_cpu_prefix_cache(max_bytes=size, automatic=True, save_on_release=True)
+    engine.add_request([1] * 257, params(api, max_tokens=2))
+    engine.step_with_events()
+    engine.step_with_events()
+    # Nothing was waiting, so the idle block stays a plain GPU hit.
+    assert engine.is_finished() and cache.stats["saved_blocks"] == 0
+
+
+def test_repeated_admission_checks_do_not_rehash_a_waiting_prompt(api, monkeypatch):
+    engine, manager, key = completed_prefix(api, [[90], [91]])
+    cache = automatic_cache(engine, blocks=1)
+    for prompt in ([3] * 257, [4]):
+        engine.add_request(prompt, params(api, max_tokens=1))
+        engine.step_with_events()
+    assert key in cache and key not in manager.hash_to_block_id
+    seq = api.Sequence([1] * 257, params(api, max_tokens=1))
+    assert manager.can_allocate(seq) == 1
+    calls = []
+    original = manager.compute_hash
+    monkeypatch.setattr(manager, "compute_hash", lambda *a: calls.append(a) or original(*a))
+    assert manager.can_allocate(seq) == 1
+    assert calls == []
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda", "cuda-slow-copies"])
+def test_prefetch_restores_blocked_waiting_hits_while_others_decode(api, device):
+    slow = device == "cuda-slow-copies"
+    device = "cuda" if slow else device
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA device unavailable")
+    engine = cached_engine(api, [[10], [20], [21], [22], [30]], num_blocks=4)
+    engine.model_runner.kv_cache = engine.model_runner.kv_cache.to(device)
+    pool = engine.model_runner.kv_cache
+    manager = engine.scheduler.block_manager
+    size = pool[:, :, 0].numel() * pool.element_size()
+    cache = engine.create_cpu_prefix_cache(max_bytes=2 * size, automatic=True, prefetch=True)
+    if slow:
+        slow_copies(cache)
+    write_scheduled_kv(engine)
+    engine.add_request([1] * 257, params(api, max_tokens=1))
+    engine.step_with_events()
+    key = manager.compute_hash([1] * 256)
+    source = manager.hash_to_block_id[key]
+    expected = pool[:, :, source].contiguous().cpu().view(torch.uint8).clone()
+    cache.save_block(key)
+    # Drop the GPU copy so only the CPU payload can supply this prefix. The
+    # direct zero_() bypasses the allocator's ordering, so finish the save first.
+    cache.synchronize()
+    del manager.hash_to_block_id[key]
+    manager.blocks[source].hash, manager.blocks[source].token_ids = -1, []
+    pool[:, :, source].zero_()
+    engine.add_request([3] * 257, params(api, max_tokens=3))
+    engine.step_with_events()  # Running request holds 2 of 4 blocks.
+    waiting = engine.add_request([1] * 256 + [5] * 300, params(api, max_tokens=1))
+    engine.step_with_events()  # Waiting needs 3 blocks; one spare block prefetches its hit.
+    assert key in manager.hash_to_block_id and cache.prefetched_blocks == 1
+    assert [seq.seq_id for seq in engine.scheduler.waiting] == [waiting]
+    engine.step_with_events()
+    result = engine.step_with_events()
+    assert result.num_tokens == 300  # Admitted with the prefetched block as a GPU hit.
+    target = manager.hash_to_block_id[key]
+    assert torch.equal(pool[:, :, target].contiguous().cpu().view(torch.uint8), expected)
+    assert cache.stats["restored_blocks"] == 1
+    assert not manager.used_block_ids
+    assert_pool_consistent(manager)
