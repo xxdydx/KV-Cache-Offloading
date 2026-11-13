@@ -26,6 +26,9 @@ class Sequence:
         self.num_scheduled_tokens = 0
         self.is_prefill = True
         self.block_table = []
+        # Token range whose KV is restored by copy while the head before it
+        # is prefilled (split CPU-cache admission); skipped once reached.
+        self.restore_span: tuple[int, int] | None = None
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos

@@ -30,7 +30,8 @@ class Scheduler:
         self.last_schedule: ScheduleDecision | None = None
         self.eos = config.eos
         self.block_size = config.kvcache_block_size
-        self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
+        self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size,
+                                          getattr(config, "kv_eviction", "lru"))
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
 
@@ -87,9 +88,11 @@ class Scheduler:
         # and their references retryable, including earlier admissions in a batch.
         prefill_states = []
         removed_waiting = []
+        original_waiting = list(self.waiting)
+        i = 0  # Requests before i are split admissions whose head is already scheduled.
         try:
-            while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
-                seq = self.waiting[0]
+            while i < len(self.waiting) and len(scheduled_seqs) < self.max_num_seqs:
+                seq = self.waiting[i]
                 remaining = budget - num_batched_tokens
                 if remaining == 0:
                     break
@@ -109,14 +112,20 @@ class Scheduler:
                     break
                 if not seq.block_table:
                     self.block_manager.allocate(seq, num_cached_blocks)
-                seq.num_scheduled_tokens = min(num_tokens, remaining)
+                # A split admission prefills only up to its restore span first.
+                end = seq.restore_span[0] if seq.restore_span else seq.num_tokens
+                seq.num_scheduled_tokens = min(end - seq.num_cached_tokens, remaining)
                 num_batched_tokens += seq.num_scheduled_tokens
+                scheduled_seqs.append(seq)
                 if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
                     seq.status = SequenceStatus.RUNNING
-                    self.waiting.popleft()
+                    del self.waiting[i]
                     removed_waiting.append(seq)
                     self.running.append(seq)
-                scheduled_seqs.append(seq)
+                elif seq.restore_span and seq.num_cached_tokens + seq.num_scheduled_tokens == seq.restore_span[0]:
+                    i += 1  # Head fully scheduled; it stays queued, later requests may join.
+                else:
+                    break  # A chunked prefill stays at the head of the queue.
 
         except BaseException:
             for seq, cached, scheduled, status, had_blocks in reversed(prefill_states):
@@ -127,7 +136,8 @@ class Scheduler:
                 seq.status = status
             for seq in removed_waiting:
                 self.running.remove(seq)
-            self.waiting.extendleft(reversed(removed_waiting))
+            self.waiting.clear()
+            self.waiting.extend(original_waiting)
             raise
 
         return scheduled_seqs
@@ -186,6 +196,8 @@ class Scheduler:
             self.block_manager.hash_blocks(seq)
             seq.num_cached_tokens += seq.num_scheduled_tokens
             seq.num_scheduled_tokens = 0
+            if seq.restore_span and seq.num_cached_tokens == seq.restore_span[0]:
+                self.block_manager.finish_restore_span(seq)
             if is_prefill and seq.num_cached_tokens < seq.num_tokens:
                 continue
             seq.append_token(token_id)

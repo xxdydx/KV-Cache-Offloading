@@ -1,4 +1,4 @@
-"""Summarize an agent-replay matrix: paired per-seed deltas vs gpu_only with 95% t-intervals.
+"""Summarize an agent-replay matrix: paired per-seed deltas vs a baseline (gpu_only) with 95% t-intervals.
 
 Run directories are named <config>-<policy>-s<seed>-r<rep>. Configs listed in
 --merge are pooled under the first name as extra repeats (e.g. a headline config
@@ -6,7 +6,7 @@ and its repeat). --attach SRC:DST adds SRC's runs (e.g. an ablation without its
 own gpu_only control) to DST's groups with the same seed and repeat.
 
 Run: python3 -m bench.summarize_agent_replay RESULTS_DIR [--merge ctx16k,ctx16k-rep]
-     [--attach ablate16k:ctx16k] [--out FILE]
+     [--attach ablate16k:ctx16k] [--baseline POLICY] [--out FILE]
 """
 
 import argparse
@@ -18,7 +18,7 @@ from pathlib import Path
 
 # Two-sided 95% Student t critical values by degrees of freedom.
 T95 = {1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447, 7: 2.365, 8: 2.306, 9: 2.262}
-NAME = re.compile(r"^(?P<config>.+)-(?P<policy>gpu_only|cpu_[a-z]+)-s(?P<seed>\d+)-r(?P<rep>\d+)$")
+NAME = re.compile(r"^(?P<config>.+)-(?P<policy>gpu_only(?:_[a-z0-9]+)*|cpu_[a-z0-9_]+|vllm_[a-z0-9_]+)-s(?P<seed>\d+)-r(?P<rep>\d+)$")
 
 
 def load(directory: Path):
@@ -49,7 +49,7 @@ def interval(values):
     return mean, T95[len(values) - 1] * statistics.stdev(values) / len(values) ** 0.5
 
 
-def summarize(runs, merge=(), attach=None):
+def summarize(runs, merge=(), attach=None, baseline="gpu_only"):
     alias = {name: merge[0] for name in merge} if merge else {}
     attach = attach or {}
     groups = defaultdict(dict)  # config -> {(seed, rep): {policy: run}}
@@ -63,31 +63,28 @@ def summarize(runs, merge=(), attach=None):
         groups[config].setdefault(key, {})[run["policy"]] = run
     table = []
     for config, pairs in groups.items():
-        policies = sorted({p for runs_ in pairs.values() for p in runs_}, key=lambda p: (p != "gpu_only", p))
+        policies = sorted({p for runs_ in pairs.values() for p in runs_}, key=lambda p: (p != baseline, p))
         for policy in policies:
             own = [r[policy] for r in pairs.values() if policy in r]
             row = {"config": config, "policy": policy, "n": len(own)}
             for metric in ("wall_s", "traj_per_min", "ttft_p50_ms", "ttft_p95_ms", "reuse", "prefill_s", "decode_s"):
                 row[metric] = statistics.fmean(r[metric] for r in own)
-            paired = [r for r in pairs.values() if policy in r and "gpu_only" in r]
-            if policy != "gpu_only" and paired:
-                deltas = [100 * (r[policy]["traj_per_min"] / r["gpu_only"]["traj_per_min"] - 1)
-                          for r in pairs.values() if policy in r and "gpu_only" in r]
-                ttft = [100 * (r[policy]["ttft_p50_ms"] / r["gpu_only"]["ttft_p50_ms"] - 1)
-                        for r in pairs.values() if policy in r and "gpu_only" in r]
+            paired = [r for r in pairs.values() if policy in r and baseline in r]
+            if policy != baseline and paired:
+                deltas = [100 * (r[policy]["traj_per_min"] / r[baseline]["traj_per_min"] - 1) for r in paired]
+                ttft = [100 * (r[policy]["ttft_p50_ms"] / r[baseline]["ttft_p50_ms"] - 1) for r in paired]
                 row["paired_n"] = len(deltas)
                 row["traj_delta_pct"], row["traj_delta_ci95"] = interval(deltas)
                 row["ttft_p50_delta_pct"], row["ttft_p50_delta_ci95"] = interval(ttft)
                 row["wins"] = sum(d > 0 for d in deltas)
                 # Pairs must do identical work (prompt and output tokens) to be comparable.
-                row["work_mismatches"] = sum(r[policy]["work"] != r["gpu_only"]["work"]
-                                             for r in pairs.values() if policy in r and "gpu_only" in r)
+                row["work_mismatches"] = sum(r[policy]["work"] != r[baseline]["work"] for r in paired)
             table.append(row)
     return table
 
 
-def markdown(table):
-    lines = ["| Config | Policy | n | wall s | traj/min | Δ traj/min vs gpu_only (95% CI) | wins | "
+def markdown(table, baseline="gpu_only"):
+    lines = [f"| Config | Policy | n | wall s | traj/min | Δ traj/min vs {baseline} (95% CI) | wins | "
              "TTFT p50 ms (Δ) | reuse | prefill s | decode s |",
              "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"]
     for row in table:
@@ -111,11 +108,12 @@ def main():
     parser.add_argument("--merge", default="", help="Comma-separated configs to pool under the first")
     parser.add_argument("--attach", action="append", default=[], metavar="SRC:DST",
                         help="Pair SRC's runs with DST's gpu_only runs of the same seed/repeat")
+    parser.add_argument("--baseline", default="gpu_only", help="Policy the deltas are paired against")
     parser.add_argument("--out", type=Path, help="Write the JSON table here")
     args = parser.parse_args()
     attach = dict(item.split(":", 1) for item in args.attach)
-    table = summarize(load(args.results), [m for m in args.merge.split(",") if m], attach)
-    print(markdown(table))
+    table = summarize(load(args.results), [m for m in args.merge.split(",") if m], attach, args.baseline)
+    print(markdown(table, args.baseline))
     if args.out:
         args.out.write_text(json.dumps(table, indent=2) + "\n")
 

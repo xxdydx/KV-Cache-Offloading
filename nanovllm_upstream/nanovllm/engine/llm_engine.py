@@ -84,14 +84,18 @@ class LLMEngine:
 
     def create_cpu_prefix_cache(self, max_bytes: int, *, automatic: bool = False,
                                 save_on_release: bool = False, preallocate: bool = False,
-                                prefetch: bool = False) -> CPUBlockCache:
+                                prefetch: bool = False, split_streams: bool = False,
+                                fp8: bool = False,
+                                hybrid: tuple[float, float, float] | None = None) -> CPUBlockCache:
         """Create this engine's bounded TP=1 CPU block cache.
 
         automatic=True preserves idle blocks before recycling and restores CPU
         hits during admission; save_on_release=True saves them as soon as they
         become idle instead; prefetch=True restores a blocked waiting
         request's CPU hits in the background. On CUDA, copies run on a dedicated stream ordered
-        by events; preallocate=True pins the whole budget up front. Manual
+        by events (split_streams=True: one per direction); preallocate=True pins the whole
+        budget up front. fp8=True stores lossy FP8 payloads; hybrid recomputes the head of a
+        CPU-only prefix while the rest restores (see CPUBlockCache). Manual
         calls and cache configuration belong on the engine-owning thread
         between steps.
         """
@@ -100,9 +104,26 @@ class LLMEngine:
             raise RuntimeError("this engine already has a CPU prefix cache")
         cache = CPUBlockCache(self.model_runner, self.scheduler.block_manager, max_bytes,
                               automatic=automatic, save_on_release=save_on_release,
-                              preallocate=preallocate, prefetch=prefetch)
+                              preallocate=preallocate, prefetch=prefetch,
+                              split_streams=split_streams, fp8=fp8, hybrid=hybrid)
         self._cpu_prefix_cache = cache
         return cache
+
+    def prefetch_prefix(self, prefix: list[int] | Sequence) -> int:
+        """Client hint that a request starting with prefix will arrive soon.
+
+        Starts background restores of its CPU hits into free blocks (beyond
+        one per running request for decode growth); returns how many. Does
+        nothing while requests wait for admission, so hints never take
+        blocks they need. Requires a CPU cache created with prefetch=True.
+        Pass the same Sequence when repeating a hint to reuse its block hashes.
+        """
+        if self.scheduler.waiting:
+            return 0
+        if not isinstance(prefix, Sequence):
+            prefix = Sequence(prefix)
+        return self.scheduler.block_manager.prefetch(prefix,
+                                                     reserve=len(self.scheduler.running))
 
     def detach_request(self, seq_id: int) -> KVSnapshot:
         if seq_id in self._detached_requests:

@@ -51,13 +51,22 @@ class Qwen3Attention(nn.Module):
             hidden_size,
             bias=False,
         )
+        yarn = None
         if isinstance(rope_scaling, dict):
             rope_theta = rope_scaling.get("rope_theta", rope_theta)
+            kind = rope_scaling.get("rope_type", rope_scaling.get("type"))
+            if kind == "yarn":
+                # Like transformers: factor = extended / original positions.
+                original = rope_scaling["original_max_position_embeddings"]
+                yarn = (max_position / original, original)
+            elif kind not in (None, "default"):
+                raise NotImplementedError(f"rope_type {kind!r} is not supported")
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,
             max_position=max_position,
             base=rope_theta,
+            yarn=yarn,
         )
         self.attn = Attention(
             self.num_heads,

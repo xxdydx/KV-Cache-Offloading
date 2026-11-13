@@ -43,3 +43,36 @@ def test_attached_ablation_pairs_with_target_control(tmp_path):
     assert row["config"] == "ctx" and abs(row["traj_delta_pct"] - 20) < 1e-9
     lonely = next(r for r in table if r["config"] == "lonely")
     assert "traj_delta_pct" not in lonely and "`cpu_full`" in markdown(table)
+
+
+def test_multi_word_policies_and_custom_baseline(tmp_path):
+    write_run(tmp_path, "ctx-gpu_only-s7-r0", 10)
+    write_run(tmp_path, "ctx-gpu_only_mru-s7-r0", 11)
+    write_run(tmp_path, "ctx-cpu_full-s7-r0", 12)
+    write_run(tmp_path, "ctx-cpu_exact_hint-s7-r0", 15)
+    table = summarize(load(tmp_path), baseline="cpu_full")
+    assert [r["policy"] for r in table][0] == "cpu_full"
+    hint = next(r for r in table if r["policy"] == "cpu_exact_hint")
+    assert abs(hint["traj_delta_pct"] - 25) < 1e-9
+    assert {r["policy"] for r in table} == {"gpu_only", "gpu_only_mru", "cpu_full", "cpu_exact_hint"}
+    assert "vs cpu_full" in markdown(table, "cpu_full")
+
+
+def test_per_turn_summary_pairs_turn_indices(tmp_path):
+    from bench.summarize_turns import load_turns, markdown as turn_markdown, summarize_turns
+
+    def write(name, ttfts):
+        run = tmp_path / name
+        run.mkdir()
+        turns = [{"turn": i, "prompt_len": 100 * (i + 1), "num_cached_tokens": 50 * i,
+                  "ttft_s": t, "turn_latency_s": 2 * t} for i, t in enumerate(ttfts)]
+        (run / "result.json").write_text(json.dumps({"turns": turns}))
+
+    write("h-gpu_only-s7-r0", [1.0, 2.0])
+    write("h-cpu_full-s7-r0", [1.0, 1.0])
+    write("other-cpu_full-s7-r0", [9.0, 9.0])
+    rows = summarize_turns(load_turns(tmp_path, "h"))
+    assert [row["turn"] for row in rows] == [0, 1]
+    assert rows[1]["cpu_full"]["ttft_delta_pct"] == -50
+    assert rows[1]["cpu_full"]["reused"] == 0.25
+    assert "1000 (-50%), 25%" in turn_markdown(rows, ["gpu_only", "cpu_full"])

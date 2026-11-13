@@ -6,6 +6,23 @@ import numpy as np
 from nanovllm.engine.sequence import Sequence
 
 
+def plan_split(cpu_blocks: int, block_size: int, restore_s_per_block: float,
+               recompute_s_per_token: float, recompute_s_per_token2: float) -> int:
+    """How many leading CPU-hit blocks to recompute while the rest restore.
+
+    The head of a prefix depends on nothing after it, so recomputing it on
+    the GPU can overlap restoring the remainder over PCIe. Picks the split
+    that minimizes the slower of the two, using
+    recompute(t) = t * recompute_s_per_token + t^2 * recompute_s_per_token2.
+    """
+    def cost(k):
+        tokens = k * block_size
+        recompute = tokens * recompute_s_per_token + tokens * tokens * recompute_s_per_token2
+        return max(recompute, (cpu_blocks - k) * restore_s_per_block)
+
+    return min(range(cpu_blocks + 1), key=cost)
+
+
 class Block:
 
     def __init__(self, block_id):
@@ -13,6 +30,9 @@ class Block:
         self.ref_count = 0
         self.hash = -1
         self.token_ids = []
+        # Last owner release (BlockManager.deallocate call) and position there; for MRU eviction.
+        self.release_gen = 0
+        self.seq_index = 0
 
     def update(self, hash: int, token_ids: list[int]):
         self.hash = hash
@@ -26,14 +46,21 @@ class Block:
 
 class BlockManager:
 
-    def __init__(self, num_blocks: int, block_size: int):
+    def __init__(self, num_blocks: int, block_size: int, eviction: str = "lru"):
+        if eviction not in ("lru", "mru"):
+            raise ValueError("eviction must be 'lru' or 'mru'")
         self.block_size = block_size
+        self.eviction = eviction
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
         self.hash_to_block_id: dict[int, int] = dict()
         self.free_block_ids: deque[int] = deque(range(num_blocks))
         self.used_block_ids: set[int] = set()
         self._cpu_prefix_cache = None
         self._last_prefetch = None
+        self._release_gen = 0
+        # Idle blocks a blocked request's prefetch is keeping for it (MRU only;
+        # LRU moves them to the back of the free list instead).
+        self._protected: set[int] = set()
         # Set by the scheduler while the head waiting request cannot be admitted.
         self.admission_blocked = False
 
@@ -45,10 +72,32 @@ class BlockManager:
         h.update(np.array(token_ids).tobytes())
         return h.intdigest()
 
+    def _is_published(self, block: Block) -> bool:
+        return block.hash != -1 and self.hash_to_block_id.get(block.hash) == block.block_id
+
+    def _victim(self) -> int:
+        if self.eviction == "lru":
+            return self.free_block_ids[0]
+        # Unpublished blocks first, then the most recently released request's
+        # blocks, tail first. With similar tool waits, the agent that finished
+        # last returns last, which is the case where LRU evicts exactly the
+        # context needed next.
+        best = None
+        for block_id in self.free_block_ids:
+            block = self.blocks[block_id]
+            if not self._is_published(block):
+                return block_id
+            if block_id in self._protected:
+                continue
+            key = (block.release_gen, block.seq_index)
+            if best is None or key > best[0]:
+                best = (key, block_id)
+        return best[1] if best is not None else self.free_block_ids[0]
+
     def _allocate_block(self, order_writes: bool = True) -> int:
         # Preserve before removing the free slot or invalidating its metadata.
         # Unexpected copy failures leave this candidate available and indexed.
-        block_id = self.free_block_ids[0]
+        block_id = self._victim()
         block = self.blocks[block_id]
         assert block.ref_count == 0
         if block.hash != -1 and self.hash_to_block_id.get(block.hash) == block_id:
@@ -57,7 +106,11 @@ class BlockManager:
             del self.hash_to_block_id[block.hash]
         if order_writes and self._cpu_prefix_cache is not None:
             self._cpu_prefix_cache.before_block_reuse(block_id)
-        self.free_block_ids.popleft()
+        if self.free_block_ids[0] == block_id:
+            self.free_block_ids.popleft()
+        else:
+            self.free_block_ids.remove(block_id)
+        self._protected.discard(block_id)
         block.reset()
         self.used_block_ids.add(block_id)
         return block_id
@@ -78,8 +131,9 @@ class BlockManager:
         if block.ref_count == 0:
             self.free_block_ids.remove(block_id)
             self.used_block_ids.add(block_id)
-            if self._cpu_prefix_cache is not None:
-                self._cpu_prefix_cache.before_block_use(block_id)
+        if self._cpu_prefix_cache is not None:
+            # Also when shared: another request's restore span may still be copying it.
+            self._cpu_prefix_cache.before_block_use(block_id)
         block.ref_count += 1
 
     def _release_block(self, block_id: int):
@@ -170,13 +224,14 @@ class BlockManager:
         for block_id in own_idle:
             self.free_block_ids.remove(block_id)
             self.free_block_ids.append(block_id)
+        self._protected = set(own_idle)
         started = 0
         for h, token_ids, block_id, entry in prefix:
             if started == budget:
                 break
             if entry is not None:
-                self.restore_cached_block(h, token_ids,
-                                          lambda target, e=entry: cache._copy_entry(e, target, wait=False))
+                self._protected.add(self.restore_cached_block(
+                    h, token_ids, lambda target, e=entry: cache._copy_entry(e, target, wait=False)))
                 started += 1
         cache._prefetched_blocks += started
         return started
@@ -218,6 +273,10 @@ class BlockManager:
                                      for _, _, block_id, _ in prefix)
         if len(self.free_block_ids) < needed:
             raise MemoryError("not enough free KV blocks to admit the request")
+        split = self._plan_split(prefix)
+        if split == len(prefix):
+            prefix, num_cached_blocks, split = [], 0, 0  # Recomputing everything is fastest.
+        self._protected.clear()
         table = [-1] * seq.num_blocks
         owned = []
         try:
@@ -229,14 +288,19 @@ class BlockManager:
                     owned.append(block_id)
                     table[i] = block_id
             for i, (h, token_ids, block_id, entry) in enumerate(prefix):
-                if block_id is None:
+                if block_id is None and i >= split:
                     block_id = self._allocate_block()
                     owned.append(block_id)
                     table[i] = block_id
-                    self._cpu_prefix_cache._copy_entry(entry, block_id)
+                    # With a split, the head prefill overlaps these copies;
+                    # finish_restore_span orders the first read after them.
+                    if split:
+                        self._cpu_prefix_cache._copy_entry(entry, block_id, wait=False)
+                    else:
+                        self._cpu_prefix_cache._copy_entry(entry, block_id)
                     self.blocks[block_id].update(h, token_ids)
                     self.hash_to_block_id[h] = block_id
-            for i in range(num_cached_blocks, seq.num_blocks):
+            for i in [*range(split), *range(num_cached_blocks, seq.num_blocks)]:
                 block_id = self._allocate_block()
                 owned.append(block_id)
                 table[i] = block_id
@@ -245,12 +309,41 @@ class BlockManager:
                 self._release_block(block_id)
             raise
         seq.block_table = table
-        seq.num_cached_tokens = num_cached_blocks * self.block_size
+        if split:
+            seq.num_cached_tokens = 0
+            seq.restore_span = (split * self.block_size, num_cached_blocks * self.block_size)
+        else:
+            seq.num_cached_tokens = num_cached_blocks * self.block_size
+
+    def _plan_split(self, prefix) -> int:
+        """Leading blocks to recompute instead of restore (0: restore all hits)."""
+        cache = self._cpu_prefix_cache
+        if cache is None or cache.hybrid is None:
+            return 0
+        lead = next((i for i, (_, _, block_id, _) in enumerate(prefix) if block_id is not None),
+                    len(prefix))
+        split = plan_split(lead, self.block_size, *cache.hybrid)
+        # Splitting before a GPU hit only helps if something still restores.
+        return split if split < lead or lead == len(prefix) else 0
+
+    def finish_restore_span(self, seq: Sequence):
+        """Skip a split admission's restored span once its head is prefilled."""
+        start, end = seq.restore_span
+        assert seq.num_cached_tokens == start
+        seq.restore_span = None
+        seq.num_cached_tokens = end
+        for block_id in seq.block_table[start // self.block_size:end // self.block_size]:
+            self._cpu_prefix_cache.before_block_use(block_id)
 
     def deallocate(self, seq: Sequence):
+        self._release_gen += 1
+        for i, block_id in enumerate(seq.block_table):
+            self.blocks[block_id].release_gen = self._release_gen
+            self.blocks[block_id].seq_index = i
         for block_id in reversed(seq.block_table):
             self._release_block(block_id)
         seq.num_cached_tokens = 0
+        seq.restore_span = None
         seq.block_table.clear()
 
     def allocate_for_resume(self, seq: Sequence, num_cached_tokens: int):

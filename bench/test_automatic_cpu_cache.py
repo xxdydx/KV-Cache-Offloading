@@ -34,13 +34,17 @@ def write_scheduled_kv(engine):
     engine.model_runner.call = run
 
 
-def slow_copies(cache):
-    """Delay every background copy so missing stream ordering corrupts bytes reliably."""
-    for name in ("save_block", "_copy_entry"):
+def slow_copies(cache, names=("save_block", "_copy_entry")):
+    """Delay background copies so missing stream ordering corrupts bytes reliably.
+
+    Delete the instance attribute (e.g. `del cache.save_block`) to undo.
+    """
+    streams = {"save_block": cache._copy_stream, "_copy_entry": cache._restore_stream}
+    for name, stream in ((name, streams[name]) for name in names):
         original = getattr(cache, name)
 
-        def delayed(*args, _original=original, **kwargs):
-            with torch.cuda.stream(cache._copy_stream):
+        def delayed(*args, _original=original, _stream=stream, **kwargs):
+            with torch.cuda.stream(_stream):
                 torch.cuda._sleep(20_000_000)
             return _original(*args, **kwargs)
 
